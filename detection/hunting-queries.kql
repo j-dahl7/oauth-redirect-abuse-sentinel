@@ -1,0 +1,124 @@
+// =============================================================================
+// OAuth Redirect Abuse Hunting Queries for Microsoft Sentinel
+// Companion lab: j-dahl7/oauth-redirect-abuse-sentinel
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// HUNT 1: Enumerate All OAuth Apps with Delegated Permissions
+// Purpose: Baseline audit — identify all apps with user-granted permissions
+// -----------------------------------------------------------------------------
+AuditLogs
+| where TimeGenerated > ago(90d)
+| where OperationName == "Add delegated permission grant"
+    or OperationName == "Consent to application"
+| extend ConsentUser = tostring(InitiatedBy.user.userPrincipalName)
+| extend AppDisplayName = tostring(TargetResources[0].displayName)
+| extend AppId = tostring(TargetResources[0].id)
+| mv-expand ModifiedProperty = TargetResources[0].modifiedProperties
+| extend PropertyName = tostring(ModifiedProperty.displayName)
+| extend PropertyValue = tostring(ModifiedProperty.newValue)
+| where PropertyName in ("DelegatedPermissionGrant.Scope", "ConsentAction.Permissions")
+| summarize
+    PermissionsGranted = make_set(PropertyValue),
+    GrantCount = count(),
+    Users = make_set(ConsentUser, 50),
+    FirstSeen = min(TimeGenerated),
+    LastSeen = max(TimeGenerated)
+    by AppDisplayName, AppId
+| sort by GrantCount desc
+
+// -----------------------------------------------------------------------------
+// HUNT 2: OAuth Sign-ins from Non-Corporate IPs
+// Purpose: Find OAuth app authentications from unexpected locations
+// -----------------------------------------------------------------------------
+let CorporateNetworks = dynamic(["203.0.113.0/24", "198.51.100.0/24"]); // Replace with your ranges
+SigninLogs
+| where TimeGenerated > ago(30d)
+| where AppDisplayName !in ("Microsoft Office", "Azure Portal", "Microsoft Teams",
+    "Outlook Mobile", "Windows Sign In", "Microsoft Authentication Broker")
+| where ResourceDisplayName has "Graph" or ResourceDisplayName has "Office 365"
+| evaluate ipv4_is_in_any_range(IPAddress, CorporateNetworks) == false
+| summarize
+    SignInCount = count(),
+    DistinctIPs = dcount(IPAddress),
+    IPs = make_set(IPAddress, 10),
+    Users = make_set(UserPrincipalName, 10),
+    Locations = make_set(strcat(Location, " (", LocationDetails.city, ")"), 10)
+    by AppDisplayName, AppId
+| where SignInCount > 5
+| sort by DistinctIPs desc
+
+// -----------------------------------------------------------------------------
+// HUNT 3: Recently Registered Apps with High-Privilege Permissions
+// Purpose: Find newly created apps requesting sensitive scopes
+// -----------------------------------------------------------------------------
+let HighPrivilegeScopes = dynamic([
+    "Mail.Read", "Mail.ReadWrite", "Mail.Send",
+    "Files.ReadWrite.All", "Files.Read.All",
+    "User.ReadWrite.All", "Directory.ReadWrite.All",
+    "Sites.ReadWrite.All", "MailboxSettings.ReadWrite",
+    "Contacts.ReadWrite", "People.Read.All"
+]);
+AuditLogs
+| where TimeGenerated > ago(14d)
+| where OperationName in ("Add application", "Add service principal")
+| extend AppName = tostring(TargetResources[0].displayName)
+| extend AppId = tostring(TargetResources[0].id)
+| extend CreatedBy = tostring(InitiatedBy.user.userPrincipalName)
+| join kind=leftouter (
+    AuditLogs
+    | where TimeGenerated > ago(14d)
+    | where OperationName in ("Add delegated permission grant", "Add app role assignment to service principal")
+    | extend PermApp = tostring(TargetResources[0].displayName)
+    | mv-expand ModProp = TargetResources[0].modifiedProperties
+    | extend Scope = tostring(ModProp.newValue)
+    | where Scope has_any (HighPrivilegeScopes)
+    | summarize Scopes = make_set(Scope) by PermApp
+) on $left.AppName == $right.PermApp
+| where isnotempty(Scopes)
+| project TimeGenerated, AppName, AppId, CreatedBy, Scopes
+
+// -----------------------------------------------------------------------------
+// HUNT 4: OAuth Redirect URI Inventory
+// Purpose: Full inventory of redirect URIs across all app registrations
+// Run via Graph API (PowerShell) — KQL for audit trail only
+// -----------------------------------------------------------------------------
+AuditLogs
+| where TimeGenerated > ago(90d)
+| where OperationName in ("Add application", "Update application")
+| mv-expand ModifiedProperty = TargetResources[0].modifiedProperties
+| where ModifiedProperty.displayName == "AppAddress"
+| extend RedirectUris = tostring(ModifiedProperty.newValue)
+| extend AppName = tostring(TargetResources[0].displayName)
+| extend ModifiedBy = coalesce(
+    tostring(InitiatedBy.user.userPrincipalName),
+    tostring(InitiatedBy.app.displayName)
+)
+| project TimeGenerated, AppName, RedirectUris, ModifiedBy, OperationName
+| sort by TimeGenerated desc
+
+// -----------------------------------------------------------------------------
+// HUNT 5: Token Replay After OAuth Redirect Error
+// Purpose: Detect pattern where a high-confidence OAuth authorization error
+//   is followed by a successful sign-in from a different IP (possible token relay)
+// -----------------------------------------------------------------------------
+let OAuthErrors = SigninLogs
+    | where TimeGenerated > ago(7d)
+    | where ResultType in ("65001", "65004", "70011", "700016", "70000", "7000218")
+    | project ErrorTime = TimeGenerated, UserPrincipalName, ErrorIP = IPAddress, AppId, ResultType;
+let SuccessfulSignIns = SigninLogs
+    | where TimeGenerated > ago(7d)
+    | where ResultType == "0"
+    | project SuccessTime = TimeGenerated, UserPrincipalName, SuccessIP = IPAddress, AppId, TokenIssuerType;
+OAuthErrors
+| join kind=inner (SuccessfulSignIns) on UserPrincipalName, AppId
+| where SuccessTime between (ErrorTime .. (ErrorTime + 30m))
+| where ErrorIP != SuccessIP
+| project
+    ErrorTime,
+    SuccessTime,
+    UserPrincipalName,
+    AppId,
+    ErrorIP,
+    SuccessIP,
+    TimeDelta = SuccessTime - ErrorTime

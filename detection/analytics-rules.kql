@@ -1,0 +1,162 @@
+// =============================================================================
+// OAuth Redirect Abuse Detection Rules for Microsoft Sentinel
+// Companion lab: j-dahl7/oauth-redirect-abuse-sentinel
+// Reference: https://www.microsoft.com/en-us/security/blog/2026/03/02/oauth-redirection-abuse-enables-phishing-malware-delivery/
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// RULE 1: Suspicious OAuth App Consent from Phishing Indicators
+// Severity: High
+// MITRE: T1566.002 (Spearphishing Link)
+// Description: Detects OAuth consent grants where the user's sign-in session
+//   shows phishing risk indicators (risky sign-in, unfamiliar location, or
+//   sign-in from a flagged IP) shortly before granting consent.
+// -----------------------------------------------------------------------------
+let PhishingWindow = 15m;
+let RiskySignIns = SigninLogs
+    | where TimeGenerated > ago(1d)
+    | where RiskLevelDuringSignIn in ("high", "medium")
+        or RiskEventTypes_V2 has_any ("unfamiliarFeatures", "anonymizedIPAddress", "maliciousIPAddress", "suspiciousIPAddress", "malwareInfectedIPAddress", "suspiciousBrowser")
+    | project SignInTime = TimeGenerated, UserPrincipalName, IPAddress, RiskLevelDuringSignIn, RiskEventTypes_V2, CorrelationId;
+AuditLogs
+| where TimeGenerated > ago(1d)
+| where OperationName == "Consent to application"
+| extend ConsentInitiatedBy = tostring(InitiatedBy.user.userPrincipalName)
+| extend AppDisplayName = tostring(TargetResources[0].displayName)
+| extend AppId = tostring(TargetResources[0].id)
+| extend ConsentPermissions = tostring(TargetResources[0].modifiedProperties)
+| join kind=inner (RiskySignIns) on $left.ConsentInitiatedBy == $right.UserPrincipalName
+| where TimeGenerated between (SignInTime .. (SignInTime + PhishingWindow))
+| project
+    TimeGenerated,
+    UserPrincipalName = ConsentInitiatedBy,
+    AppDisplayName,
+    AppId,
+    ConsentPermissions,
+    RiskLevel = RiskLevelDuringSignIn,
+    RiskEvents = RiskEventTypes_V2,
+    SourceIP = IPAddress
+
+// -----------------------------------------------------------------------------
+// RULE 2: OAuth App Registration with Suspicious Redirect URI
+// Severity: Medium
+// MITRE: T1098 (Account Manipulation)
+// Description: Detects new app registrations or updates that add redirect URIs
+//   pointing to non-organizational domains, free hosting, tunneling services,
+//   or URL shorteners commonly used in OAuth redirect abuse campaigns.
+// -----------------------------------------------------------------------------
+let SuspiciousDomains = dynamic([
+    // Tunneling services
+    "ngrok.io", "ngrok-free.app", "trycloudflare.com", "serveo.net", "localtunnel.me",
+    // Free hosting / PaaS
+    "workers.dev", "pages.dev", "herokuapp.com", "netlify.app", "vercel.app",
+    "github.io", "gitlab.io", "surge.sh", "glitch.me", "replit.dev",
+    "powerappsportals.com",
+    // Webhook / request capture
+    "webhook.site", "requestbin.com", "pipedream.com",
+    // URL shorteners
+    "bit.ly", "tinyurl.com", "t.co", "rebrand.ly"
+]);
+AuditLogs
+| where TimeGenerated > ago(1d)
+| where OperationName in ("Add application", "Update application")
+| mv-expand ModifiedProperty = TargetResources[0].modifiedProperties
+| where ModifiedProperty.displayName == "AppAddress"
+| extend NewRedirectUris = tostring(ModifiedProperty.newValue)
+| where NewRedirectUris != "[]"
+| extend InitiatedByUser = tostring(InitiatedBy.user.userPrincipalName)
+| extend InitiatedByApp = tostring(InitiatedBy.app.displayName)
+| extend AppName = tostring(TargetResources[0].displayName)
+| extend AppObjectId = tostring(TargetResources[0].id)
+| where NewRedirectUris has_any (SuspiciousDomains)
+    or NewRedirectUris has "http://" // non-HTTPS redirects
+| project
+    TimeGenerated,
+    OperationName,
+    AppName,
+    AppObjectId,
+    NewRedirectUris,
+    InitiatedByUser,
+    InitiatedByApp
+
+// -----------------------------------------------------------------------------
+// RULE 3: OAuth Error-Based Redirect to External URL
+// Severity: High
+// MITRE: T1566.002 (Spearphishing Link), T1204.001 (User Execution: Malicious Link)
+// Description: Detects sign-in attempts to OAuth applications that result in
+//   the Entra errors most closely associated with redirect abuse. The strongest
+//   signals are 65001 and 65004. Additional OAuth failures are included as
+//   supporting context when they cluster around the same app and time window.
+//
+// High-confidence signals:
+//   65001 — User has not consented (interaction_required). Primary prompt=none signal.
+//   65004 — User actively declined consent (access_denied).
+// Supporting context:
+//   70011, 700016, 70000, 7000218 — broader OAuth failures that may show up
+//   when an attacker or a broken app probes the same flow.
+// -----------------------------------------------------------------------------
+SigninLogs
+| where TimeGenerated > ago(1d)
+| where ResultType in (
+    "65001",   // User has not consented (prompt=none attack vector)
+    "65004",   // User declined consent
+    "70011",   // Invalid scope or other OAuth parameter issue
+    "70000",   // InvalidGrant
+    "700016",  // Application not found in tenant
+    "7000218", // Request body must contain client_assertion or client_secret
+    "AADSTS65001",
+    "AADSTS65004",
+    "AADSTS70011",
+    "AADSTS700016"
+)
+| extend AppName = AppDisplayName
+| extend AppIdUsed = AppId
+| where AppName !in ("Microsoft Office", "Azure Portal", "Microsoft Teams", "Outlook Mobile")
+| summarize
+    ErrorCount = count(),
+    DistinctUsers = dcount(UserPrincipalName),
+    Users = make_set(UserPrincipalName, 10),
+    ErrorCodes = make_set(ResultType),
+    IPs = make_set(IPAddress, 10)
+    by AppName, AppIdUsed, bin(TimeGenerated, 1h)
+| where ErrorCount > 3 or DistinctUsers > 2
+| project
+    TimeGenerated,
+    AppName,
+    AppIdUsed,
+    ErrorCount,
+    DistinctUsers,
+    Users,
+    ErrorCodes,
+    IPs
+
+// -----------------------------------------------------------------------------
+// RULE 4: Bulk OAuth Consent Grants to Single Application
+// Severity: High
+// MITRE: T1566.002 (Spearphishing Link)
+// Description: Detects when multiple users grant consent to the same OAuth
+//   application within a short time window — a strong indicator of a phishing
+//   campaign pushing users to authorize a malicious app.
+// -----------------------------------------------------------------------------
+let ConsentThreshold = 3;
+let TimeWindow = 1h;
+AuditLogs
+| where TimeGenerated > ago(1d)
+| where OperationName == "Consent to application"
+| extend ConsentUser = tostring(InitiatedBy.user.userPrincipalName)
+| extend AppDisplayName = tostring(TargetResources[0].displayName)
+| extend AppId = tostring(TargetResources[0].id)
+| summarize
+    ConsentCount = count(),
+    ConsentUsers = make_set(ConsentUser, 20),
+    FirstConsent = min(TimeGenerated),
+    LastConsent = max(TimeGenerated)
+    by AppDisplayName, AppId, bin(TimeGenerated, TimeWindow)
+| where ConsentCount >= ConsentThreshold
+| project
+    TimeGenerated,
+    AppDisplayName,
+    AppId,
+    ConsentCount,
+    ConsentUsers,
+    ConsentWindow = LastConsent - FirstConsent
