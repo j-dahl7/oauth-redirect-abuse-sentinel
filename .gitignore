@@ -2,6 +2,10 @@
 oauth-audit-report.csv
 reports/
 
+# Python test artifacts
+__pycache__/
+*.py[cod]
+
 # PowerShell/editor artifacts
 *.tmp
 .vscode/
