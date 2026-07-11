@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.3
 <#
 .SYNOPSIS
     Applies OAuth hardening policies to Microsoft Entra ID.
@@ -7,15 +7,18 @@
     Configures tenant-level controls to prevent OAuth redirect abuse:
     1. Restricts user consent to apps from verified publishers only
     2. Requires admin approval for high-privilege permissions
-    3. Enables app consent workflow for user requests
-    4. Creates a Conditional Access policy for risky OAuth-related sign-ins
-    5. Configures app governance alerts (if licensed)
+    3. Provides the Entra admin-center steps for an admin consent workflow
+    4. Creates a report-only Conditional Access policy for risky sign-ins
 
 .PARAMETER WhatIf
     Show what changes would be made without applying them.
 
 .PARAMETER EnableConsentWorkflow
-    Enable the admin consent workflow so users can request app access.
+    Show the admin-center guidance for enabling an admin consent workflow.
+
+.PARAMETER ExcludedUserIds
+    Entra user object IDs to exclude from the report-only Conditional Access policy.
+    Add emergency-access accounts before considering enforcement.
 
 .EXAMPLE
     ./Set-OAuthHardening.ps1 -WhatIf
@@ -29,10 +32,41 @@
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter()]
-    [switch]$EnableConsentWorkflow
+    [switch]$EnableConsentWorkflow,
+
+    [Parameter()]
+    [string[]]$ExcludedUserIds = @()
 )
 
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
+
+function Invoke-GraphJsonRequest {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('PATCH', 'POST')]
+        [string]$Method,
+
+        [Parameter(Mandatory)]
+        [string]$Url,
+
+        [Parameter(Mandatory)]
+        [string]$JsonBody
+    )
+
+    $bodyFile = New-TemporaryFile
+    try {
+        [System.IO.File]::WriteAllText($bodyFile.FullName, $JsonBody, [System.Text.Encoding]::UTF8)
+        az rest --method $Method `
+            --url $Url `
+            --body "@$($bodyFile.FullName)" `
+            --headers 'Content-Type=application/json'
+    }
+    finally {
+        Remove-Item $bodyFile.FullName -Force -ErrorAction SilentlyContinue
+    }
+}
 
 Write-Host "`n=== OAuth Hardening Configuration ===" -ForegroundColor Cyan
 Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
@@ -63,18 +97,15 @@ if ($PSCmdlet.ShouldProcess("Authorization Policy", "Restrict user consent to ve
         }
     } | ConvertTo-Json -Depth 5
 
-    $bodyFile = New-TemporaryFile
-    [System.IO.File]::WriteAllText($bodyFile.FullName, $body, [System.Text.Encoding]::UTF8)
-
-    az rest --method PATCH `
-        --url 'https://graph.microsoft.com/v1.0/policies/authorizationPolicy' `
-        --body "@$($bodyFile.FullName)" `
-        --headers 'Content-Type=application/json' 2>$null
-
-    Remove-Item $bodyFile.FullName -ErrorAction SilentlyContinue
+    $null = Invoke-GraphJsonRequest `
+        -Method PATCH `
+        -Url 'https://graph.microsoft.com/v1.0/policies/authorizationPolicy' `
+        -JsonBody $body
     Write-Host "  Updated: Users can only consent to low-risk permissions from verified publishers" -ForegroundColor Green
+    $consentSummary = 'Restricted to verified publishers (low-risk perms only, owned-resource grants preserved)'
 } else {
     Write-Host "  [WHATIF] Would restrict user consent to verified publishers only" -ForegroundColor DarkYellow
+    $consentSummary = 'Planned restriction to verified publishers (no change applied)'
 }
 
 # --- Step 2: Enable Admin Consent Workflow ---
@@ -112,7 +143,7 @@ $caPolicy = @{
     conditions  = @{
         users = @{
             includeUsers = @("All")
-            excludeUsers = @()
+            excludeUsers = @($ExcludedUserIds)
         }
         applications = @{
             includeApplications = @("All")
@@ -132,9 +163,6 @@ $caPolicy = @{
     }
 } | ConvertTo-Json -Depth 10
 
-$bodyFile = New-TemporaryFile
-[System.IO.File]::WriteAllText($bodyFile.FullName, $caPolicy, [System.Text.Encoding]::UTF8)
-
 if ($existing) {
     $existingLabel = if ($existing.displayName -eq $legacyCaDisplayName) {
         "$($existing.displayName) (legacy name)"
@@ -143,10 +171,10 @@ if ($existing) {
     }
 
     if ($PSCmdlet.ShouldProcess("Conditional Access", "Update policy: $existingLabel")) {
-        $result = az rest --method PATCH `
-            --url "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies/$($existing.id)" `
-            --body "@$($bodyFile.FullName)" `
-            --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
+        $result = Invoke-GraphJsonRequest `
+            -Method PATCH `
+            -Url "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies/$($existing.id)" `
+            -JsonBody $caPolicy | ConvertFrom-Json
 
         if (-not $result) {
             $result = az rest --method GET `
@@ -157,25 +185,27 @@ if ($existing) {
         Write-Host "  Updated CA policy: $($result.displayName)" -ForegroundColor Green
         Write-Host "  State: Report-only (review before enforcing)" -ForegroundColor Yellow
         Write-Host "  Policy ID: $($result.id)" -ForegroundColor DarkGray
+        $caSummary = 'Report-only MFA step-up policy updated'
     } else {
         Write-Host "  [WHATIF] Would update CA policy: $existingLabel" -ForegroundColor DarkYellow
+        $caSummary = 'Planned report-only MFA policy update (no change applied)'
     }
 } else {
     if ($PSCmdlet.ShouldProcess("Conditional Access", "Create policy: $caDisplayName")) {
-        $result = az rest --method POST `
-            --url 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies' `
-            --body "@$($bodyFile.FullName)" `
-            --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
+        $result = Invoke-GraphJsonRequest `
+            -Method POST `
+            -Url 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies' `
+            -JsonBody $caPolicy | ConvertFrom-Json
 
         Write-Host "  Created CA policy: $($result.displayName)" -ForegroundColor Green
         Write-Host "  State: Report-only (review before enforcing)" -ForegroundColor Yellow
         Write-Host "  Policy ID: $($result.id)" -ForegroundColor DarkGray
+        $caSummary = 'Report-only MFA step-up policy created'
     } else {
         Write-Host "  [WHATIF] Would create CA policy: $caDisplayName" -ForegroundColor DarkYellow
+        $caSummary = 'Planned report-only MFA policy creation (no change applied)'
     }
 }
-
-Remove-Item $bodyFile.FullName -ErrorAction SilentlyContinue
 
 # --- Step 4: Block Legacy Authentication (if not already done) ---
 Write-Host "[4/4] Checking legacy authentication block..." -ForegroundColor Yellow
@@ -191,9 +221,10 @@ if ($legacyPolicy) {
 
 Write-Host ""
 Write-Host "=== Hardening Summary ===" -ForegroundColor Cyan
-Write-Host "1. User consent: Restricted to verified publishers (low-risk perms only, owned-resource grants preserved)"
+Write-Host "1. User consent: $consentSummary"
 Write-Host "2. Admin consent workflow: $(if ($EnableConsentWorkflow) { 'Guidance provided' } else { 'Skipped' })"
-Write-Host "3. CA policy: Report-only MFA step-up policy created (review before enforcing)"
+Write-Host "3. CA policy: $caSummary (review before enforcing)"
+Write-Host "   Emergency-access exclusions: $($ExcludedUserIds.Count) configured"
 Write-Host "4. Legacy auth: $(if ($legacyPolicy) { 'Blocked' } else { 'NOT blocked - action required' })"
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Yellow

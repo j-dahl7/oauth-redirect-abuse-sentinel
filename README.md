@@ -7,6 +7,13 @@ A hands-on lab deploying detection and hardening for OAuth redirect abuse — th
 
 > **Blog Post:** For detailed explanations of the attack technique and detection logic, see [Detecting OAuth Redirect Abuse with Microsoft Sentinel and Entra ID](https://nineliveszerotrust.com/blog/oauth-redirect-abuse-sentinel/).
 
+## Verification status
+
+- **Last reviewed:** 2026-07-10
+- **Scope:** PowerShell parser checks, KQL consistency review, safe `-WhatIf` control flow, Graph pagination, documentation/link review, and repository secret scanning.
+- **Status:** Statically verified for detection-only deployment; tenant hardening is opt-in.
+- **Limitation:** No live Sentinel workspace or Entra tenant was changed during this review. Queries still require matching `SigninLogs`/`AuditLogs` schemas and tenant-specific tuning.
+
 ---
 
 ## What Gets Deployed
@@ -25,10 +32,12 @@ A hands-on lab deploying detection and hardening for OAuth redirect abuse — th
 
 - Azure subscription with an existing **Microsoft Sentinel** workspace
 - Azure CLI configured (`az login`)
-- PowerShell 7+ (`pwsh`)
-- **Security Administrator** or **Sentinel Contributor** role on the workspace
-- **Conditional Access Administrator** role (for hardening policies, skip with `-SkipHardening`)
-- **Application.Read.All** Graph permission (for the OAuth audit, skip with `-SkipAudit`)
+- PowerShell 7.3+ (`pwsh`)
+- **Microsoft Sentinel Contributor** on the target workspace/resource group
+- Sufficient Microsoft Graph read access for applications, service principals, and delegated permission grants (skip the audit with `-SkipAudit`)
+- For optional hardening: an appropriate Entra administrator role plus `Policy.ReadWrite.Authorization` and `Policy.ReadWrite.ConditionalAccess` access
+
+Existing Sentinel ingestion and retention charges still apply. The lab creates no separate compute service, but scheduled queries can consume workspace resources.
 
 ---
 
@@ -47,17 +56,27 @@ cd oauth-redirect-abuse-sentinel
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab"
 ```
 
-Or detection only (no tenant changes):
+This defaults to detection content plus the read-only OAuth application audit; it does not change tenant-wide consent or Conditional Access settings.
+
+Preview Azure writes without applying them:
 
 ```powershell
-./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -SkipHardening -SkipAudit
+./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -SkipAudit -WhatIf
 ```
+
+Apply tenant hardening only after reviewing the current consent policy and emergency-access exclusions:
+
+```powershell
+./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -ApplyHardening -ExcludedUserIds "<break-glass-object-id>"
+```
+
+`-ExcludedUserIds` is forwarded to the hardening script. The policy remains report-only, but supplying emergency-access exclusions at creation avoids an unsafe gap if it is enforced later.
 
 The script will:
 1. Verify the Sentinel workspace exists and Sentinel is enabled
 2. Deploy 4 scheduled analytics rules via the Sentinel REST API
 3. Deploy the OAuth Security Dashboard workbook
-4. Apply OAuth hardening policies (consent restriction, CA policy)
+4. Optionally apply OAuth hardening policies when `-ApplyHardening` is present
 5. Run the OAuth app audit and save a CSV report
 
 ### 3. Verify Deployment
@@ -134,6 +153,12 @@ Creates a report-only lab CA policy that applies when:
 
 Review the policy for 7 days before enforcing it.
 
+The generated policy is report-only and targets all users/apps. Before enforcement, add emergency-access account exclusions, confirm licensing, and validate impact in Conditional Access insights. To supply exclusions when running the hardening script directly:
+
+```powershell
+./hardening/Set-OAuthHardening.ps1 -ExcludedUserIds "<break-glass-object-id>" -WhatIf
+```
+
 ### OAuth App Audit
 
 Run the audit independently:
@@ -148,6 +173,8 @@ The audit checks every app registration for:
 - High-privilege delegated permissions (Mail.Read, Files.ReadWrite.All, etc.)
 - User-consented vs admin-consented permissions
 - Multi-tenant app registrations
+
+The audit follows Graph pagination and evaluates delegated grants, redirect URIs, and sign-in audience. It does not currently resolve application-role grants or application ownership, so use it as a focused lab report rather than a complete tenant governance inventory.
 
 Output is a CSV sorted by risk score.
 
@@ -228,3 +255,7 @@ The hardening script requires **Conditional Access Administrator** and **Policy.
 - [Microsoft: Conditional Access for risky sign-ins](https://learn.microsoft.com/en-us/entra/id-protection/howto-identity-protection-configure-risk-policies)
 - [Azure Monitor Logs reference: SigninLogs](https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/signinlogs)
 - [KQL Reference](https://learn.microsoft.com/en-us/kusto/query/)
+
+## License
+
+No license file is currently included; default copyright applies until the repository owner selects one.

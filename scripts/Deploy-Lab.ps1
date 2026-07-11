@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 7.3
 <#
 .SYNOPSIS
     Deploys the OAuth Redirect Abuse Detection Lab.
@@ -8,7 +8,7 @@
     1. Sentinel analytics rules (4 scheduled rules for OAuth abuse detection)
     2. Sentinel hunting queries (5 proactive hunting packs)
     3. Sentinel workbook (OAuth Security Dashboard)
-    4. OAuth hardening policies (user consent restrictions, CA policy)
+    4. Optional OAuth hardening policies (user consent restrictions, CA policy)
     5. Runs the OAuth app audit
 
 .PARAMETER ResourceGroup
@@ -17,8 +17,14 @@
 .PARAMETER WorkspaceName
     Name of the Log Analytics workspace with Sentinel enabled.
 
+.PARAMETER ApplyHardening
+    Apply tenant-level OAuth hardening policies. Omitted by default so the lab deploys detection-only.
+
+.PARAMETER ExcludedUserIds
+    Entra user object IDs, such as emergency-access accounts, to exclude from the report-only Conditional Access policy.
+
 .PARAMETER SkipHardening
-    Skip applying OAuth hardening policies (useful for detection-only deployment).
+    Deprecated compatibility switch. If present, tenant hardening is skipped even when ApplyHardening is present.
 
 .PARAMETER SkipAudit
     Skip running the OAuth app audit.
@@ -28,11 +34,11 @@
 
 .EXAMPLE
     ./Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab"
-    Deploy to an existing Sentinel workspace.
+    Deploy detection rules, workbook, and audit to an existing Sentinel workspace.
 
 .EXAMPLE
-    ./Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -SkipHardening
-    Deploy detection rules only, skip tenant hardening.
+    ./Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -ApplyHardening
+    Deploy detection content and apply tenant hardening policies.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -44,6 +50,12 @@ param(
     [string]$WorkspaceName,
 
     [Parameter()]
+    [switch]$ApplyHardening,
+
+    [Parameter()]
+    [string[]]$ExcludedUserIds = @(),
+
+    [Parameter()]
     [switch]$SkipHardening,
 
     [Parameter()]
@@ -51,6 +63,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LabRoot = Split-Path -Parent $ScriptDir
 
@@ -208,26 +221,31 @@ foreach ($rule in $rules) {
         }
     } | ConvertTo-Json -Depth 10
 
-    $bodyFile = New-TemporaryFile
-    [System.IO.File]::WriteAllText($bodyFile.FullName, $ruleBody, [System.Text.Encoding]::UTF8)
-
     $ruleId = if ($existingRuleIdsByName[$rule.displayName]) {
         $existingRuleIdsByName[$rule.displayName]
     } else {
         [guid]::NewGuid().ToString()
     }
     $ruleAction = if ($existingRuleIdsByName[$rule.displayName]) { "Updated" } else { "Created" }
-    $result = az rest --method PUT `
-        --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/${ruleId}?api-version=2024-03-01" `
-        --body "@$($bodyFile.FullName)" `
-        --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
 
-    Remove-Item $bodyFile.FullName -ErrorAction SilentlyContinue
+    if ($PSCmdlet.ShouldProcess($rule.displayName, "$ruleAction Sentinel analytics rule")) {
+        $bodyFile = New-TemporaryFile
+        try {
+            [System.IO.File]::WriteAllText($bodyFile.FullName, $ruleBody, [System.Text.Encoding]::UTF8)
+            $result = az rest --method PUT `
+                --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/${ruleId}?api-version=2024-03-01" `
+                --body "@$($bodyFile.FullName)" `
+                --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
 
-    if ($result.name) {
-        Write-Host "    ${ruleAction}: $($result.name)" -ForegroundColor Green
-    } else {
-        Write-Host "    Warning: Rule may not have deployed correctly" -ForegroundColor Red
+            if ($result.name) {
+                Write-Host "    ${ruleAction}: $($result.name)" -ForegroundColor Green
+            } else {
+                throw "Sentinel did not return an analytics rule resource"
+            }
+        }
+        finally {
+            Remove-Item $bodyFile.FullName -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -334,48 +352,55 @@ $workbookBody = @{
     }
 } | ConvertTo-Json -Depth 10
 
-$bodyFile = New-TemporaryFile
-[System.IO.File]::WriteAllText($bodyFile.FullName, $workbookBody, [System.Text.Encoding]::UTF8)
+if ($PSCmdlet.ShouldProcess($workbookDisplayName, "$workbookAction Sentinel workbook")) {
+    $bodyFile = New-TemporaryFile
+    try {
+        [System.IO.File]::WriteAllText($bodyFile.FullName, $workbookBody, [System.Text.Encoding]::UTF8)
+        $wbResult = az rest --method PUT `
+            --url "/subscriptions/$(($workspaceId -split '/')[2])/resourceGroups/$ResourceGroup/providers/Microsoft.Insights/workbooks/${workbookId}?api-version=2022-04-01" `
+            --body "@$($bodyFile.FullName)" `
+            --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
 
-$wbResult = az rest --method PUT `
-    --url "/subscriptions/$(($workspaceId -split '/')[2])/resourceGroups/$ResourceGroup/providers/Microsoft.Insights/workbooks/${workbookId}?api-version=2022-04-01" `
-    --body "@$($bodyFile.FullName)" `
-    --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
-
-Remove-Item $bodyFile.FullName -ErrorAction SilentlyContinue
-
-if ($wbResult.name) {
-    Write-Host "  Workbook $($workbookAction.ToLower()): $($wbResult.properties.displayName)" -ForegroundColor Green
-} else {
-    Write-Host "  Warning: Workbook may not have deployed correctly" -ForegroundColor Red
+        if ($wbResult.name) {
+            Write-Host "  Workbook $($workbookAction.ToLower()): $($wbResult.properties.displayName)" -ForegroundColor Green
+        } else {
+            throw "Azure did not return a workbook resource"
+        }
+    }
+    finally {
+        Remove-Item $bodyFile.FullName -ErrorAction SilentlyContinue
+    }
 }
 
 # --- Step 3: Apply Hardening ---
-if (-not $SkipHardening) {
+if ($ApplyHardening -and -not $SkipHardening) {
     Write-Host "`n[3/5] Applying OAuth hardening..." -ForegroundColor Yellow
-    & "$LabRoot/hardening/Set-OAuthHardening.ps1"
+    & "$LabRoot/hardening/Set-OAuthHardening.ps1" `
+        -ExcludedUserIds $ExcludedUserIds `
+        -WhatIf:$WhatIfPreference
 } else {
-    Write-Host "`n[3/5] Skipping hardening (use without -SkipHardening to apply)" -ForegroundColor DarkGray
+    Write-Host "`n[3/5] Skipping tenant hardening (add -ApplyHardening to apply)" -ForegroundColor DarkGray
 }
 
 # --- Step 4: Run Audit ---
-if (-not $SkipAudit) {
+if (-not $SkipAudit -and -not $WhatIfPreference) {
     Write-Host "`n[4/5] Running OAuth app audit..." -ForegroundColor Yellow
     & "$LabRoot/hardening/Audit-OAuthApps.ps1" -OutputPath "$LabRoot/oauth-audit-report.csv"
 } else {
-    Write-Host "`n[4/5] Skipping audit (use without -SkipAudit to run)" -ForegroundColor DarkGray
+    Write-Host "`n[4/5] Skipping audit (disabled explicitly or during -WhatIf preview)" -ForegroundColor DarkGray
 }
 
 # --- Step 5: Summary ---
-Write-Host "`n[5/5] Deployment complete!" -ForegroundColor Green
+$completionLabel = if ($WhatIfPreference) { 'Deployment preview complete; no changes applied.' } else { 'Deployment complete!' }
+Write-Host "`n[5/5] $completionLabel" -ForegroundColor Green
 Write-Host ""
-Write-Host "=== Deployed Resources ===" -ForegroundColor Cyan
+Write-Host "=== $(if ($WhatIfPreference) { 'Planned Resources' } else { 'Deployed Resources' }) ===" -ForegroundColor Cyan
 Write-Host "  Analytics Rules: 4 scheduled rules"
 Write-Host "  Workbook:        OAuth Security Dashboard"
-if (-not $SkipHardening) {
+if ($ApplyHardening -and -not $SkipHardening -and -not $WhatIfPreference) {
     Write-Host "  Hardening:       User consent restricted, CA policy (report-only)"
 }
-if (-not $SkipAudit) {
+if (-not $SkipAudit -and -not $WhatIfPreference) {
     Write-Host "  Audit Report:    $LabRoot/oauth-audit-report.csv"
 }
 Write-Host ""

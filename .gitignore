@@ -1,0 +1,8 @@
+# Generated tenant audit reports may contain application identifiers and findings.
+oauth-audit-report.csv
+reports/
+
+# PowerShell/editor artifacts
+*.tmp
+.vscode/
+.idea/
