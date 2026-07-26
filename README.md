@@ -1,11 +1,25 @@
 # OAuth Redirect Abuse Detection Lab
 
-A hands-on lab deploying detection and hardening for OAuth redirect abuse — the technique Microsoft warned about in their [March 2026 advisory](https://www.microsoft.com/en-us/security/blog/2026/03/02/oauth-redirection-abuse-enables-phishing-malware-delivery/).
+A hands-on lab deploying Sentinel detection content for OAuth redirect abuse,
+with explicitly opt-in Entra hardening — the technique Microsoft described in
+its [March 2026 advisory](https://www.microsoft.com/en-us/security/blog/2026/03/02/oauth-redirection-abuse-enables-phishing-malware-delivery/).
 
-**Cost:** Uses existing Sentinel workspace (no additional resources)
-**Cleanup:** Delete analytics rules and workbook from Sentinel, remove CA policy from Entra
+**Cost:** Uses an existing Sentinel workspace; ingestion, retention, and
+licensing charges still apply.
+
+**Cleanup:** Remove the lab-owned Sentinel objects and, only if applied, restore
+the captured tenant consent configuration and remove the exact CA policy.
 
 > **Blog Post:** For detailed explanations of the attack technique and detection logic, see [Detecting OAuth Redirect Abuse with Microsoft Sentinel and Entra ID](https://nineliveszerotrust.com/blog/oauth-redirect-abuse-sentinel/).
+
+## Validation Boundary
+
+The hardened July 25, 2026 revision was checked with offline PowerShell parsing,
+mocked safety tests, and KQL/static contract review. It was not deployed to a
+tenant, no live Graph hardening call was made, and no live Sentinel query or
+incident was validated for this revision. Rule output depends on the target
+workspace's `SigninLogs`/`AuditLogs` schema, data connectors, volume, and
+ingestion latency.
 
 ---
 
@@ -15,7 +29,8 @@ A hands-on lab deploying detection and hardening for OAuth redirect abuse — th
 |---|---|---|
 | 4 Analytics Rules | Sentinel Scheduled | OAuth consent after risky sign-in, suspicious redirect URI, OAuth error patterns, bulk consent |
 | 1 Workbook | Azure Workbook | OAuth Security Dashboard (consent timeline, error patterns, URI changes, top apps) |
-| 1 CA Policy | Entra ID | Report-only step-up policy for risky OAuth-related sign-ins |
+| Optional consent policy change | Entra ID | Tenant authorization-policy update; applied only with `-ApplyHardening` |
+| Optional CA Policy | Entra ID | Report-only step-up policy; created/updated only with `-ApplyHardening` |
 | 5 Hunting Queries | KQL files | Delegated permissions audit, non-corporate IPs, new high-priv apps, URI inventory, token replay |
 | 1 Audit Script | PowerShell | Enumerate all OAuth apps for suspicious redirect URIs and overprivileged permissions |
 
@@ -26,9 +41,19 @@ A hands-on lab deploying detection and hardening for OAuth redirect abuse — th
 - Azure subscription with an existing **Microsoft Sentinel** workspace
 - Azure CLI configured (`az login`)
 - PowerShell 7+ (`pwsh`)
-- **Security Administrator** or **Sentinel Contributor** role on the workspace
-- **Conditional Access Administrator** role (for hardening policies, skip with `-SkipHardening`)
-- **Application.Read.All** Graph permission (for the OAuth audit, skip with `-SkipAudit`)
+- **Microsoft Sentinel Contributor** or equivalent rule/workbook write
+  permissions on the workspace
+- **Application.Read.All** Graph permission for the default read-only OAuth
+  audit (omit the audit with `-SkipAudit`)
+- **Conditional Access Administrator** plus the required Graph policy-write
+  permissions only when deliberately using `-ApplyHardening`
+- Exact Entra object IDs for emergency-access accounts to pass through
+  `-ExcludedUserIds` before applying the report-only CA policy
+
+The existing Sentinel workspace is a shared target. The deployment creates or
+updates rules and a workbook there. Entra hardening is **off by default** because
+the consent-policy change is tenant-wide and the CA policy applies to all users
+except the object IDs you explicitly exclude.
 
 ---
 
@@ -43,30 +68,70 @@ cd oauth-redirect-abuse-sentinel
 
 ### 2. Deploy
 
+Preview first:
+
+```powershell
+./scripts/Deploy-Lab.ps1 `
+  -ResourceGroup "rg-sentinel-lab" `
+  -WorkspaceName "law-sentinel-lab" `
+  -WhatIf
+```
+
+Default deployment writes the four Sentinel rules and workbook, then performs
+a read-only Graph audit and writes `oauth-audit-report.csv` locally. It does not
+apply tenant hardening:
+
 ```powershell
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab"
 ```
 
-Or detection only (no tenant changes):
+To omit the audit and its local CSV:
 
 ```powershell
-./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -SkipHardening -SkipAudit
+./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -SkipAudit
 ```
 
-The script will:
-1. Verify the Sentinel workspace exists and Sentinel is enabled
-2. Deploy 4 scheduled analytics rules via the Sentinel REST API
-3. Deploy the OAuth Security Dashboard workbook
-4. Apply OAuth hardening policies (consent restriction, CA policy)
-5. Run the OAuth app audit and save a CSV report
+Only after capturing the current consent-policy collection, verifying the
+tenant, reviewing report-only impact, and identifying emergency-access account
+object IDs, opt in to hardening:
+
+```powershell
+./scripts/Deploy-Lab.ps1 `
+  -ResourceGroup "rg-sentinel-lab" `
+  -WorkspaceName "law-sentinel-lab" `
+  -ApplyHardening `
+  -ExcludedUserIds @("<break-glass-object-id-1>","<break-glass-object-id-2>")
+```
+
+The script:
+
+1. Verifies the Sentinel workspace exists and Sentinel is enabled
+2. Deploys 4 scheduled analytics rules via the Sentinel REST API
+3. Deploys the OAuth Security Dashboard workbook
+4. Applies OAuth hardening only when `-ApplyHardening` is present
+5. Runs the OAuth app audit and saves a CSV report unless `-SkipAudit` is present
+
+`-WhatIf` performs discovery/read calls but skips guarded cloud writes, tenant
+hardening, temporary request-body files, and the audit/CSV. It does not validate
+KQL results or CA impact. `-SkipHardening` remains only as a deprecated
+compatibility switch; absence of `-ApplyHardening` is the normal safe default.
+Analytics rules and the workbook use deterministic workspace-scoped IDs plus
+explicit ownership markers. Deployment fails closed instead of adopting a
+same-named resource or overwriting a deterministic ID whose marker does not match.
+
+Current deployment parameters are `-ResourceGroup`, `-WorkspaceName`,
+`-ApplyHardening`, `-ExcludedUserIds`, `-SkipHardening` (deprecated),
+`-SkipAudit`, `-Destroy`, and PowerShell's common `-WhatIf` switch.
 
 ### 3. Verify Deployment
 
 Open **Microsoft Defender portal** > **Microsoft Sentinel** > **Analytics**:
+
 - You should see 4 new rules prefixed with "LAB -"
 - All rules should show as Enabled with Scheduled type
 
 Open **Workbooks**:
+
 - Find "OAuth Security Dashboard" in the list
 
 ---
@@ -125,6 +190,10 @@ The `Set-OAuthHardening.ps1` script restricts user consent to:
 - Everything else requires **admin approval**
 - Existing `managePermissionGrantsForOwnedResource.*` entries are preserved when the policy is updated
 
+This updates the tenant's authorization policy, not a lab-scoped resource.
+Record the complete original `permissionGrantPoliciesAssigned` collection
+before applying it. The script cannot infer the desired rollback state later.
+
 ### Conditional Access Policy
 
 Creates a report-only lab CA policy that applies when:
@@ -174,20 +243,49 @@ oauth-redirect-abuse-sentinel/
 
 ### Remove Sentinel Resources
 
-Delete the analytics rules from **Microsoft Defender portal** > **Microsoft Sentinel** > **Analytics**:
-- Select rules prefixed with "LAB -" and delete
+Preview owned-resource cleanup first:
 
-Delete the workbook from **Workbooks** > "OAuth Security Dashboard"
+```powershell
+./scripts/Deploy-Lab.ps1 `
+  -ResourceGroup "rg-sentinel-lab" `
+  -WorkspaceName "law-sentinel-lab" `
+  -Destroy `
+  -WhatIf
+```
+
+Then remove the four analytics rules and workbook owned by this lab:
+
+```powershell
+./scripts/Deploy-Lab.ps1 `
+  -ResourceGroup "rg-sentinel-lab" `
+  -WorkspaceName "law-sentinel-lab" `
+  -Destroy
+```
+
+Cleanup validates every deterministic resource ID and ownership marker before
+issuing its first delete. It refuses same-title foreign objects and resources
+whose immutable ID, title/display name, or marker does not match. Legacy objects
+from older random-ID revisions are intentionally not adopted or deleted; review
+and remove those manually only after verifying their immutable IDs and content.
 
 ### Remove Hardening (if applied)
 
-**Revert consent policy:** Restore the `permissionGrantPoliciesAssigned` collection you recorded before running the lab. Do not overwrite the collection with a single legacy value if your tenant already uses `managePermissionGrantsForOwnedResource.*` entries.
+**Revert consent policy:** Restore the complete
+`permissionGrantPoliciesAssigned` collection captured immediately before the
+lab. Do not replace it with a guessed single value or discard existing
+`managePermissionGrantsForOwnedResource.*` entries.
 
 **Delete CA policy:**
+
 ```powershell
 az rest --method DELETE `
     --url 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies/<policy-id>'
 ```
+
+Use the immutable policy ID returned by deployment and first verify that its
+display name, report-only state, conditions, exclusions, and provenance match
+this lab. Cleanup does not remove `oauth-audit-report.csv`; handle that local
+report according to its potentially sensitive tenant inventory content.
 
 ---
 

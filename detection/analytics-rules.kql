@@ -89,10 +89,10 @@ AuditLogs
 //   supporting context when they cluster around the same app and time window.
 //
 // High-confidence signals:
-//   65001 — User has not consented (interaction_required). Primary prompt=none signal.
-//   65004 — User actively declined consent (access_denied).
+//   65001 - User has not consented (interaction_required). Primary prompt=none signal.
+//   65004 - User actively declined consent (access_denied).
 // Supporting context:
-//   70011, 700016, 70000, 7000218 — broader OAuth failures that may show up
+//   70011, 700016, 70000, 7000218 - broader OAuth failures that may show up
 //   when an attacker or a broken app probes the same flow.
 // -----------------------------------------------------------------------------
 SigninLogs
