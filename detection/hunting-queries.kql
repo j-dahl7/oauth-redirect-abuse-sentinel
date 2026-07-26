@@ -37,7 +37,7 @@ SigninLogs
 | where AppDisplayName !in ("Microsoft Office", "Azure Portal", "Microsoft Teams",
     "Outlook Mobile", "Windows Sign In", "Microsoft Authentication Broker")
 | where ResourceDisplayName has "Graph" or ResourceDisplayName has "Office 365"
-| evaluate ipv4_is_in_any_range(IPAddress, CorporateNetworks) == false
+| where ipv4_is_in_any_range(IPAddress, CorporateNetworks) == false
 | summarize
     SignInCount = count(),
     DistinctIPs = dcount(IPAddress),

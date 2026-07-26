@@ -1,15 +1,14 @@
-#Requires -Version 7.0
+#Requires -Version 7.3
 <#
 .SYNOPSIS
     Audits all OAuth app registrations and enterprise apps for risky permissions and redirect URIs.
 
 .DESCRIPTION
     Enumerates app registrations and service principals via Microsoft Graph to identify:
-    - Apps with high-privilege delegated or application permissions
+    - Apps with high-privilege delegated permissions
     - Apps with suspicious redirect URIs (non-HTTPS, free hosting, URL shorteners)
     - Apps with user-granted consent (vs admin-granted)
     - Multi-tenant apps registered in the tenant
-    - Apps with no owner (orphaned registrations)
 
 .PARAMETER TenantId
     Azure AD tenant ID. If not specified, uses the current az login context.
@@ -36,6 +35,57 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
+
+function Get-GraphCollection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri
+    )
+
+    $items = @()
+    $nextLink = $Uri
+    $seenLinks = [System.Collections.Generic.HashSet[string]]::new()
+
+    while ($nextLink) {
+        if (-not $seenLinks.Add($nextLink)) {
+            throw "Microsoft Graph returned a pagination cycle for '$Uri'"
+        }
+
+        $parsedNextLink = $null
+        if (
+            -not [Uri]::TryCreate($nextLink, [UriKind]::Absolute, [ref]$parsedNextLink) -or
+            $parsedNextLink.Scheme -ne 'https' -or
+            $parsedNextLink.Host -ne 'graph.microsoft.com' -or
+            $parsedNextLink.UserInfo -or
+            (-not $parsedNextLink.IsDefaultPort -and $parsedNextLink.Port -ne 443)
+        ) {
+            throw "Microsoft Graph returned an unsafe pagination URL; refusing to forward credentials"
+        }
+
+        $response = az rest --method GET --url $nextLink 2>$null | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0) {
+            throw "Microsoft Graph request failed for '$nextLink' (az exit code $LASTEXITCODE). Refusing to report a partial result as clean."
+        }
+        if (-not $response -or $null -eq $response.value) {
+            throw "Microsoft Graph returned an invalid collection response for '$nextLink'"
+        }
+
+        $items += @($response.value)
+        $nextLink = $response.'@odata.nextLink'
+    }
+
+    return $items
+}
+
+$account = az account show --output json 2>$null | ConvertFrom-Json
+if (-not $account) {
+    throw "Azure CLI is not authenticated. Run 'az login' first."
+}
+if ($TenantId -and $account.tenantId -ne $TenantId) {
+    throw "Current Azure CLI tenant '$($account.tenantId)' does not match requested tenant '$TenantId'."
+}
 
 Write-Host "`n=== OAuth Application Security Audit ===" -ForegroundColor Cyan
 Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
@@ -68,27 +118,25 @@ $SuspiciousPatterns = @(
 
 # --- Fetch App Registrations ---
 Write-Host "[1/5] Fetching app registrations..." -ForegroundColor Yellow
-$apps = az rest --method GET `
-    --url 'https://graph.microsoft.com/v1.0/applications?$top=999&$select=id,appId,displayName,web,spa,publicClient,signInAudience,createdDateTime' `
-    2>$null | ConvertFrom-Json
-$appList = $apps.value
+$appList = @(Get-GraphCollection -Uri 'https://graph.microsoft.com/v1.0/applications?$top=999&$select=id,appId,displayName,web,spa,publicClient,signInAudience,createdDateTime')
 Write-Host "  Found $($appList.Count) app registrations"
 
 # --- Fetch OAuth2 Permission Grants (delegated permissions) ---
 Write-Host "[2/5] Fetching delegated permission grants..." -ForegroundColor Yellow
-$grants = az rest --method GET `
-    --url 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$top=999' `
-    2>$null | ConvertFrom-Json
-$grantList = $grants.value
+$grantList = @(Get-GraphCollection -Uri 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$top=999')
 Write-Host "  Found $($grantList.Count) permission grants"
 
 # --- Fetch Service Principals ---
 Write-Host "[3/5] Fetching service principals..." -ForegroundColor Yellow
-$sps = az rest --method GET `
-    --url 'https://graph.microsoft.com/v1.0/servicePrincipals?$top=999&$select=id,appId,displayName,appOwnerOrganizationId,servicePrincipalType' `
-    2>$null | ConvertFrom-Json
-$spList = $sps.value
+$spList = @(Get-GraphCollection -Uri 'https://graph.microsoft.com/v1.0/servicePrincipals?$top=999&$select=id,appId,displayName,appOwnerOrganizationId,servicePrincipalType')
 Write-Host "  Found $($spList.Count) service principals"
+
+$spIdByAppId = @{}
+foreach ($sp in $spList) {
+    if ($sp.appId -and $sp.id) {
+        $spIdByAppId[$sp.appId] = $sp.id
+    }
+}
 
 # --- Analyze ---
 Write-Host "[4/5] Analyzing..." -ForegroundColor Yellow
@@ -122,9 +170,11 @@ foreach ($app in $appList) {
     }
 
     # Check delegated permissions for this app
-    $appGrants = $grantList | Where-Object {
-        $sp = $spList | Where-Object { $_.appId -eq $app.appId }
-        $sp -and $_.clientId -eq $sp.id
+    $servicePrincipalId = $spIdByAppId[$app.appId]
+    $appGrants = if ($servicePrincipalId) {
+        @($grantList | Where-Object { $_.clientId -eq $servicePrincipalId })
+    } else {
+        @()
     }
     $highPrivPerms = @()
     foreach ($grant in $appGrants) {
@@ -171,6 +221,10 @@ if ($findings.Count -eq 0) {
     Write-Host "No risky OAuth applications found." -ForegroundColor Green
 } else {
     $findings = $findings | Sort-Object -Property RiskScore -Descending
+    $outputDirectory = Split-Path -Parent $OutputPath
+    if ($outputDirectory -and -not (Test-Path -LiteralPath $outputDirectory)) {
+        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+    }
     $findings | Export-Csv -Path $OutputPath -NoTypeInformation
     Write-Host "=== FINDINGS SUMMARY ===" -ForegroundColor Red
     Write-Host "Total risky apps: $($findings.Count)" -ForegroundColor Red
