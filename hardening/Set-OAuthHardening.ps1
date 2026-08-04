@@ -210,9 +210,23 @@ if ($existing) {
 # --- Step 4: Block Legacy Authentication (if not already done) ---
 Write-Host "[4/4] Checking legacy authentication block..." -ForegroundColor Yellow
 
-$legacyPolicy = $existingPolicies.value | Where-Object { $_.displayName -match "Block.*Legacy" -or $_.displayName -match "Block.*Basic" }
-if ($legacyPolicy) {
-    Write-Host "  Legacy auth block already exists: $($legacyPolicy.displayName)" -ForegroundColor Green
+# A policy only blocks anything when its state is 'enabled'. Matching on the
+# display name alone reported "already exists" in green for a policy left
+# disabled or in report-only mode after a pilot, which is exactly the case where
+# the operator most needs to be told the control is not in force.
+$legacyPolicies = @($existingPolicies.value | Where-Object {
+    $_.displayName -match "Block.*Legacy" -or $_.displayName -match "Block.*Basic"
+})
+$enforcedLegacyPolicy = $legacyPolicies | Where-Object { $_.state -eq 'enabled' } | Select-Object -First 1
+
+if ($enforcedLegacyPolicy) {
+    Write-Host "  Legacy auth block already exists and is enabled: $($enforcedLegacyPolicy.displayName)" -ForegroundColor Green
+} elseif ($legacyPolicies.Count -gt 0) {
+    Write-Host "  WARNING: A legacy authentication policy exists but is NOT enforcing." -ForegroundColor Red
+    foreach ($policy in $legacyPolicies) {
+        Write-Host "    - $($policy.displayName) [state: $($policy.state)]" -ForegroundColor Red
+    }
+    Write-Host "  Set the policy state to 'enabled'; report-only and disabled policies block nothing." -ForegroundColor Yellow
 } else {
     Write-Host "  WARNING: No legacy authentication block detected." -ForegroundColor Red
     Write-Host "  OAuth redirect abuse is more effective when legacy auth is available." -ForegroundColor Red
@@ -225,7 +239,7 @@ Write-Host "1. User consent: $consentSummary"
 Write-Host "2. Admin consent workflow: $(if ($EnableConsentWorkflow) { 'Guidance provided' } else { 'Skipped' })"
 Write-Host "3. CA policy: $caSummary (review before enforcing)"
 Write-Host "   Emergency-access exclusions: $($ExcludedUserIds.Count) configured"
-Write-Host "4. Legacy auth: $(if ($legacyPolicy) { 'Blocked' } else { 'NOT blocked - action required' })"
+Write-Host "4. Legacy auth: $(if ($enforcedLegacyPolicy) { 'Blocked' } elseif ($legacyPolicies.Count -gt 0) { 'NOT blocked - policy exists but is not enabled' } else { 'NOT blocked - action required' })"
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Yellow
 Write-Host "  1. Review the CA policy in report-only mode for 7 days"

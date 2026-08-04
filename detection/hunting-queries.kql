@@ -31,13 +31,22 @@ AuditLogs
 // HUNT 2: OAuth Sign-ins from Non-Corporate IPs
 // Purpose: Find OAuth app authentications from unexpected locations
 // -----------------------------------------------------------------------------
-let CorporateNetworks = dynamic(["203.0.113.0/24", "198.51.100.0/24"]); // Replace with your ranges
+let CorporateNetworks = dynamic(["203.0.113.0/24", "198.51.100.0/24"]);   // your IPv4 ranges
+let CorporateNetworksV6 = dynamic([]);                                    // your IPv6 ranges, if any
 SigninLogs
 | where TimeGenerated > ago(30d)
 | where AppDisplayName !in ("Microsoft Office", "Azure Portal", "Microsoft Teams",
     "Outlook Mobile", "Windows Sign In", "Microsoft Authentication Broker")
 | where ResourceDisplayName has "Graph" or ResourceDisplayName has "Office 365"
-| where ipv4_is_in_any_range(IPAddress, CorporateNetworks) == false
+// coalesce, not ==false: ipv4_is_in_any_range returns null for an IPv6 address,
+// and `null == false` is null, so a bare comparison discarded every IPv6 row.
+// Anything we cannot positively place inside a corporate range is treated as
+// non-corporate, which is the safe default for a hunt.
+| extend IsCorporate = coalesce(
+    ipv4_is_in_any_range(IPAddress, CorporateNetworks),
+    ipv6_is_in_any_range(IPAddress, CorporateNetworksV6),
+    false)
+| where not(IsCorporate)
 | summarize
     SignInCount = count(),
     DistinctIPs = dcount(IPAddress),

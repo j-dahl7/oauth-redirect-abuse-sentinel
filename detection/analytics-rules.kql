@@ -95,6 +95,24 @@ AuditLogs
 //   70011, 700016, 70000, 7000218 - broader OAuth failures that may show up
 //   when an attacker or a broken app probes the same flow.
 // -----------------------------------------------------------------------------
+// Immutable application IDs only - display names are attacker-controlled and
+// Entra does not reserve first-party names, so an attacker can register a
+// multi-tenant app called "Microsoft Teams" and be excluded by this rule's own
+// allowlist while running the exact flow the rule exists to catch.
+//
+// Populate from your own tenant rather than from a published list:
+//   SigninLogs
+//   | where AppDisplayName in ("Microsoft Office", "Azure Portal", "Microsoft Teams", "Outlook Mobile")
+//   | summarize SeenAs = make_set(AppDisplayName) by AppId
+//
+// Left empty deliberately. An unfilled allowlist suppresses nothing, so the rule
+// is noisier rather than blind; a wrong GUID pasted in from memory would be worse.
+let ApprovedAppIds = dynamic([
+    // "00000000-0000-0000-0000-000000000000",  // Microsoft Office
+    // "00000000-0000-0000-0000-000000000000",  // Azure Portal
+    // "00000000-0000-0000-0000-000000000000",  // Microsoft Teams
+    // "00000000-0000-0000-0000-000000000000"   // Outlook Mobile
+]);
 SigninLogs
 | where TimeGenerated > ago(1d)
 | where ResultType in (
@@ -111,7 +129,7 @@ SigninLogs
 )
 | extend AppName = AppDisplayName
 | extend AppIdUsed = AppId
-| where AppName !in ("Microsoft Office", "Azure Portal", "Microsoft Teams", "Outlook Mobile")
+| where isempty(AppIdUsed) or AppIdUsed !in~ (ApprovedAppIds)
 | summarize
     ErrorCount = count(),
     DistinctUsers = dcount(UserPrincipalName),

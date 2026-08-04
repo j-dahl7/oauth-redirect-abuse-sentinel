@@ -159,12 +159,22 @@ foreach ($app in $appList) {
             $suspiciousUris += $uri
             $risks += 'NON_HTTPS_REDIRECT'
         }
-        # Known suspicious domains
-        foreach ($pattern in $SuspiciousPatterns) {
-            if ($uri -match [regex]::Escape($pattern)) {
-                $suspiciousUris += $uri
-                $risks += "SUSPICIOUS_DOMAIN:$pattern"
-                break
+        # Known suspicious domains. Match the parsed host, not a substring of the
+        # whole URI. A bare substring test flags any host that merely contains a
+        # pattern - 't.co' matches 'tenant.contoso.com' and 'github.io' matches
+        # 'mygithub.iolabs.com' - which buries real findings in false positives.
+        $uriHost = $null
+        try { $uriHost = ([System.Uri]$uri).Host } catch { $uriHost = $null }
+        if ($uriHost) {
+            $uriHost = $uriHost.TrimEnd('.').ToLowerInvariant()
+            foreach ($pattern in $SuspiciousPatterns) {
+                $needle = $pattern.ToLowerInvariant()
+                # Exact host, or a subdomain of it.
+                if ($uriHost -eq $needle -or $uriHost.EndsWith(".$needle")) {
+                    $suspiciousUris += $uri
+                    $risks += "SUSPICIOUS_DOMAIN:$pattern"
+                    break
+                }
             }
         }
     }
