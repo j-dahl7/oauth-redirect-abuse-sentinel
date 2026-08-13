@@ -43,6 +43,35 @@ class OAuthScriptContractTests(unittest.TestCase):
         self.assertNotIn("$existingRuleIdsByName", script)
         self.assertNotIn("[guid]::NewGuid()", script)
 
+    def test_deployed_oauth_rule_and_workbook_use_immutable_app_ids(self):
+        script = (ROOT / "scripts" / "Deploy-Lab.ps1").read_text(encoding="utf-8")
+
+        self.assertGreaterEqual(script.count("let ApprovedAppIds = dynamic([]);"), 2)
+        self.assertGreaterEqual(
+            script.count("AppIdUsed !in~ (ApprovedAppIds)"),
+            2,
+        )
+        self.assertNotIn("AppDisplayName !in (", script)
+        self.assertIn('techniques     = @("T1566", "T1204")', script)
+        self.assertIn('subTechniques  = @("T1566.002", "T1204.001")', script)
+
+    def test_every_workbook_query_is_bound_to_the_time_range_parameter(self):
+        script = (ROOT / "scripts" / "Deploy-Lab.ps1").read_text(encoding="utf-8")
+
+        self.assertEqual(script.count('"version": "KqlItem/1.0"'), 4)
+        self.assertEqual(
+            script.count('"timeContextFromParameter": "TimeRange"'),
+            4,
+        )
+
+    def test_documented_permissions_match_graph_endpoints(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("Directory.Read.All", readme)
+        self.assertIn("Policy.ReadWrite.Authorization", readme)
+        self.assertIn("Policy.ReadWrite.ConditionalAccess", readme)
+        self.assertNotIn("Application.Read.All", readme)
+
     def test_audit_pagination_never_forwards_credentials_off_graph(self):
         script = (ROOT / "hardening" / "Audit-OAuthApps.ps1").read_text(
             encoding="utf-8"

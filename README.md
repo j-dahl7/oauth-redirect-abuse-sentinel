@@ -40,13 +40,17 @@ ingestion latency.
 
 - Azure subscription with an existing **Microsoft Sentinel** workspace
 - Azure CLI configured (`az login`)
-- PowerShell 7+ (`pwsh`)
+- PowerShell 7.3+ (`pwsh`)
 - **Microsoft Sentinel Contributor** or equivalent rule/workbook write
   permissions on the workspace
-- **Application.Read.All** Graph permission for the default read-only OAuth
-  audit (omit the audit with `-SkipAudit`)
-- **Conditional Access Administrator** plus the required Graph policy-write
-  permissions only when deliberately using `-ApplyHardening`
+- **Directory.Read.All** Microsoft Graph delegated permission and a supported
+  Entra role (such as **Directory Readers**) for the default read-only OAuth
+  audit, including `/oauth2PermissionGrants` (omit the audit with `-SkipAudit`)
+- For the tenant-wide consent-policy update used by `-ApplyHardening`:
+  **Privileged Role Administrator** and **Policy.ReadWrite.Authorization**
+- For the report-only Conditional Access policy used by `-ApplyHardening`:
+  **Conditional Access Administrator** (or **Security Administrator**) and the
+  **Policy.Read.All** plus **Policy.ReadWrite.ConditionalAccess** permissions
 - Exact Entra object IDs for emergency-access accounts to pass through
   `-ExcludedUserIds` before applying the report-only CA policy
 
@@ -309,7 +313,12 @@ SigninLogs | take 1
 
 ### Hardening Script Fails
 
-The hardening script requires **Conditional Access Administrator** and **Policy.ReadWrite.ConditionalAccess** Graph permission. Run with `-WhatIf` to preview changes:
+The hardening script changes two different policy surfaces. Updating the tenant
+authorization policy requires **Privileged Role Administrator** and
+**Policy.ReadWrite.Authorization**. Creating the report-only Conditional Access
+policy requires **Conditional Access Administrator** (or **Security
+Administrator**) and **Policy.Read.All** plus
+**Policy.ReadWrite.ConditionalAccess**. Run with `-WhatIf` to preview changes:
 
 ```powershell
 ./hardening/Set-OAuthHardening.ps1 -WhatIf

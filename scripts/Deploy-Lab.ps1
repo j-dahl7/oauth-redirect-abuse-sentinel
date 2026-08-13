@@ -6,7 +6,7 @@
 .DESCRIPTION
     Deploys detection and hardening resources to an existing Microsoft Sentinel workspace:
     1. Sentinel analytics rules (4 scheduled rules for OAuth abuse detection)
-    2. Sentinel hunting queries (5 proactive hunting packs)
+    2. Five KQL hunting queries included in the repository for manual use
     3. Sentinel workbook (OAuth Security Dashboard)
     4. Optional OAuth hardening policies (user consent restrictions, CA policy)
     5. Runs the OAuth app audit
@@ -173,16 +173,20 @@ AuditLogs
         description = "Detects sign-in attempts to OAuth apps resulting in error codes used in redirect abuse campaigns."
         severity    = "High"
         query       = @"
+// Populate this immutable-ID allowlist from AppId values observed in your tenant.
+// An empty allowlist suppresses nothing and is safer than trusting spoofable display names.
+let ApprovedAppIds = dynamic([]);
 SigninLogs
 | where ResultType in ("65001","65004","70011","700016","70000","7000218","AADSTS65001","AADSTS65004","AADSTS70011","AADSTS700016")
-| where AppDisplayName !in ("Microsoft Office","Azure Portal","Microsoft Teams","Outlook Mobile")
+| extend AppIdUsed = AppId
+| where isempty(AppIdUsed) or AppIdUsed !in~ (ApprovedAppIds)
 | summarize ErrorCount = count(), DistinctUsers = dcount(UserPrincipalName), Users = make_set(UserPrincipalName, 10), ErrorCodes = make_set(ResultType), IPs = make_set(IPAddress, 10) by AppDisplayName, AppId, bin(TimeGenerated, 1h)
 | where ErrorCount > 3 or DistinctUsers > 2
 | project TimeGenerated, AppDisplayName, AppId, ErrorCount, DistinctUsers, Users, ErrorCodes, IPs
 "@
-        tactics        = @("InitialAccess")
-        techniques     = @("T1566")
-        subTechniques  = @("T1566.002")
+        tactics        = @("InitialAccess", "Execution")
+        techniques     = @("T1566", "T1204")
+        subTechniques  = @("T1566.002", "T1204.001")
     },
     @{
         displayName = "LAB - Bulk OAuth Consent to Single App"
@@ -390,6 +394,7 @@ $workbookContent = @'
       "content": {
         "version": "KqlItem/1.0",
         "query": "AuditLogs\n| where OperationName == \"Consent to application\"\n| extend User = tostring(InitiatedBy.user.userPrincipalName)\n| extend App = tostring(TargetResources[0].displayName)\n| summarize Consents = count() by bin(TimeGenerated, 1d), App\n| render timechart",
+        "timeContextFromParameter": "TimeRange",
         "size": 1,
         "title": "OAuth Consent Grants Over Time",
         "queryType": 0,
@@ -401,7 +406,8 @@ $workbookContent = @'
       "type": 3,
       "content": {
         "version": "KqlItem/1.0",
-        "query": "SigninLogs\n| where ResultType in (\"65001\",\"65004\",\"70011\",\"700016\",\"70000\",\"7000218\",\"AADSTS65001\",\"AADSTS65004\",\"AADSTS70011\",\"AADSTS700016\")\n| where AppDisplayName !in (\"Microsoft Office\",\"Azure Portal\",\"Microsoft Teams\",\"Outlook Mobile\")\n| summarize Errors = count() by AppDisplayName, ResultType\n| sort by Errors desc",
+        "query": "let ApprovedAppIds = dynamic([]);\nSigninLogs\n| where ResultType in (\"65001\",\"65004\",\"70011\",\"700016\",\"70000\",\"7000218\",\"AADSTS65001\",\"AADSTS65004\",\"AADSTS70011\",\"AADSTS700016\")\n| extend AppIdUsed = AppId\n| where isempty(AppIdUsed) or AppIdUsed !in~ (ApprovedAppIds)\n| summarize Errors = count() by AppDisplayName, AppId, ResultType\n| sort by Errors desc",
+        "timeContextFromParameter": "TimeRange",
         "size": 1,
         "title": "OAuth Error Patterns by Application",
         "queryType": 0,
@@ -414,6 +420,7 @@ $workbookContent = @'
       "content": {
         "version": "KqlItem/1.0",
         "query": "AuditLogs\n| where OperationName in (\"Add application\", \"Update application\")\n| mv-expand ModifiedProperty = TargetResources[0].modifiedProperties\n| where ModifiedProperty.displayName == \"AppAddress\"\n| extend RedirectUris = tostring(ModifiedProperty.newValue)\n| extend AppName = tostring(TargetResources[0].displayName)\n| extend ModifiedBy = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName))\n| project TimeGenerated, AppName, RedirectUris, ModifiedBy\n| sort by TimeGenerated desc",
+        "timeContextFromParameter": "TimeRange",
         "size": 1,
         "title": "Recent Redirect URI Changes",
         "queryType": 0,
@@ -426,6 +433,7 @@ $workbookContent = @'
       "content": {
         "version": "KqlItem/1.0",
         "query": "AuditLogs\n| where OperationName == \"Consent to application\"\n| extend User = tostring(InitiatedBy.user.userPrincipalName)\n| extend App = tostring(TargetResources[0].displayName)\n| summarize ConsentCount = count() by App\n| sort by ConsentCount desc\n| take 10",
+        "timeContextFromParameter": "TimeRange",
         "size": 1,
         "title": "Top 10 Apps by Consent Count",
         "queryType": 0,
