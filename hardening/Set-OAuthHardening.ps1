@@ -647,6 +647,9 @@ $manifest = Read-OwnershipManifest -Path $resolvedManifestPath
 if ($manifest -and [string]$manifest.tenantId -cne $actualTenantId) {
     throw "Manifest tenant '$($manifest.tenantId)' does not match active tenant '$actualTenantId'."
 }
+if ($manifest -and $manifest.state -eq 'ca-create-uncertain') {
+    throw 'A prior CA create request has an uncertain outcome. Inspect Conditional Access by immutable ID/audit history; neither apply nor rollback can continue until ownership is resolved.'
+}
 
 $authorizationPolicy = az rest --method GET --url $AuthorizationPolicyUrl `
     2>$null | ConvertFrom-Json
@@ -686,9 +689,6 @@ $intendedConsent = @(Get-NormalizedStringArray $intendedConsent)
 if ($manifest) {
     if ($manifest.state -eq 'rolled-back') {
         throw "Manifest '$resolvedManifestPath' is a completed rollback record. Archive it and choose a new manifest path for a new apply operation."
-    }
-    if ($manifest.state -eq 'ca-create-uncertain') {
-        throw 'A prior CA create request has an uncertain outcome. Inspect Conditional Access by immutable ID/audit history; do not rerun or create another policy until ownership is resolved.'
     }
     if (-not (Test-EquivalentStringArrays $manifest.conditionalAccess.excludedUserIds $reviewedExclusions)) {
         throw 'ExcludedUserIds differ from the immutable ownership manifest. Roll back first; do not mutate an owned CA policy in place.'

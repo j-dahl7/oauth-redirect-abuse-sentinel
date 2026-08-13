@@ -14,7 +14,7 @@ the captured tenant consent configuration and remove the exact CA policy.
 
 ## Validation Boundary
 
-The August 13, 2026 revision passed eighteen offline contract tests, including
+The August 13, 2026 revision passed nineteen offline contract tests, including
 PowerShell parsing; mocked preview, foreign-policy rejection, apply, idempotent
 rerun, partial-failure compensation, drift-aware rollback, and ownership
 behavior and fail-closed tenant/exclusion checks; immutable-user/App-ID rule checks; standalone-to-deployed query
