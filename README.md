@@ -14,10 +14,10 @@ the captured tenant consent configuration and remove the exact CA policy.
 
 ## Validation Boundary
 
-The August 13, 2026 revision passed eleven offline contract tests, including
+The August 13, 2026 revision passed twelve offline contract tests, including
 PowerShell parsing and mocked ownership/preview behavior, immutable-App-ID rule
-and hunt checks, parsed redirect-host matching, workbook time-range binding, and
-documented Graph-permission checks. It
+and hunt checks, standalone-to-deployed query equality, parsed redirect-host
+matching, workbook time-range binding, and documented Graph-permission checks. It
 was not deployed to a tenant, no live Graph hardening call was made, and no live
 Sentinel query or incident was validated for this revision. Rule output depends
 on the target workspace's `SigninLogs`/`AuditLogs` schema, data connectors,

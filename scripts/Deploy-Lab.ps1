@@ -133,16 +133,28 @@ $rules = @(
         query       = @"
 let PhishingWindow = 15m;
 let RiskySignIns = SigninLogs
+    | where TimeGenerated > ago(1d)
     | where RiskLevelDuringSignIn in ("high", "medium")
         or RiskEventTypes_V2 has_any ("unfamiliarFeatures", "anonymizedIPAddress", "maliciousIPAddress", "suspiciousIPAddress", "malwareInfectedIPAddress", "suspiciousBrowser")
-    | project SignInTime = TimeGenerated, UserPrincipalName, IPAddress, RiskLevelDuringSignIn;
+    | project SignInTime = TimeGenerated, UserPrincipalName, IPAddress, RiskLevelDuringSignIn, RiskEventTypes_V2, CorrelationId;
 AuditLogs
+| where TimeGenerated > ago(1d)
 | where OperationName == "Consent to application"
-| extend ConsentUser = tostring(InitiatedBy.user.userPrincipalName)
-| extend AppName = tostring(TargetResources[0].displayName)
-| join kind=inner (RiskySignIns) on `$left.ConsentUser == `$right.UserPrincipalName
+| extend ConsentInitiatedBy = tostring(InitiatedBy.user.userPrincipalName)
+| extend AppDisplayName = tostring(TargetResources[0].displayName)
+| extend AppId = tostring(TargetResources[0].id)
+| extend ConsentPermissions = tostring(TargetResources[0].modifiedProperties)
+| join kind=inner (RiskySignIns) on `$left.ConsentInitiatedBy == `$right.UserPrincipalName
 | where TimeGenerated between (SignInTime .. (SignInTime + PhishingWindow))
-| project TimeGenerated, UserPrincipalName = ConsentUser, AppName, RiskLevelDuringSignIn, IPAddress
+| project
+    TimeGenerated,
+    UserPrincipalName = ConsentInitiatedBy,
+    AppDisplayName,
+    AppId,
+    ConsentPermissions,
+    RiskLevel = RiskLevelDuringSignIn,
+    RiskEvents = RiskEventTypes_V2,
+    SourceIP = IPAddress
 "@
         tactics        = @("InitialAccess")
         techniques     = @("T1566")
@@ -153,9 +165,11 @@ AuditLogs
         description = "Detects app registrations with redirect URIs pointing to free hosting, URL shorteners, or non-HTTPS endpoints other than supported loopback development hosts."
         severity    = "Medium"
         query       = @"
+// Match exact hosts or their subdomains after parsing each absolute redirect URI.
 let SuspiciousHostRegex = @"^([a-z0-9-]+\.)*(ngrok\.io|ngrok-free\.app|trycloudflare\.com|serveo\.net|localtunnel\.me|workers\.dev|pages\.dev|herokuapp\.com|netlify\.app|vercel\.app|github\.io|gitlab\.io|surge\.sh|glitch\.me|replit\.dev|powerappsportals\.com|webhook\.site|requestbin\.com|pipedream\.com|bit\.ly|tinyurl\.com|t\.co|rebrand\.ly)$";
 let ApprovedHttpLoopbackHosts = dynamic(["localhost", "127.0.0.1"]);
 AuditLogs
+| where TimeGenerated > ago(1d)
 | where OperationName in ("Add application", "Update application")
 | mv-expand ModifiedProperty = TargetResources[0].modifiedProperties
 | where ModifiedProperty.displayName == "AppAddress"
@@ -164,11 +178,24 @@ AuditLogs
 | extend RedirectUriValues = parse_json(NewRedirectUris)
 | mv-expand RedirectUri = RedirectUriValues to typeof(string)
 | extend ParsedRedirectUri = parse_url(RedirectUri)
-| extend RedirectScheme = tolower(tostring(ParsedRedirectUri.Scheme)), RedirectHost = tolower(tostring(ParsedRedirectUri.Host))
-| extend InitiatedBy_ = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName))
+| extend RedirectScheme = tolower(tostring(ParsedRedirectUri.Scheme)),
+    RedirectHost = tolower(tostring(ParsedRedirectUri.Host))
+| extend InitiatedByUser = tostring(InitiatedBy.user.userPrincipalName)
+| extend InitiatedByApp = tostring(InitiatedBy.app.displayName)
 | extend AppName = tostring(TargetResources[0].displayName)
-| where RedirectHost matches regex SuspiciousHostRegex or (RedirectScheme == "http" and RedirectHost !in~ (ApprovedHttpLoopbackHosts))
-| project TimeGenerated, AppName, NewRedirectUris, RedirectUri, RedirectHost, InitiatedBy_
+| extend AppObjectId = tostring(TargetResources[0].id)
+| where RedirectHost matches regex SuspiciousHostRegex
+    or (RedirectScheme == "http" and RedirectHost !in~ (ApprovedHttpLoopbackHosts))
+| project
+    TimeGenerated,
+    OperationName,
+    AppName,
+    AppObjectId,
+    NewRedirectUris,
+    RedirectUri,
+    RedirectHost,
+    InitiatedByUser,
+    InitiatedByApp
 "@
         tactics        = @("Persistence")
         techniques     = @("T1098")
@@ -181,16 +208,58 @@ AuditLogs
         description = "Groups repeated OAuth errors by application as a triage lead. Error codes alone do not prove a redirect; correlate with URI changes, consent, ownership, and risk telemetry."
         severity    = "Medium"
         query       = @"
-// Populate this immutable-ID allowlist from AppId values observed in your tenant.
-// An empty allowlist suppresses nothing and is safer than trusting spoofable display names.
-let ApprovedAppIds = dynamic([]);
+// Immutable application IDs only - display names are attacker-controlled and
+// Entra does not reserve first-party names, so an attacker can register a
+// multi-tenant app called "Microsoft Teams" and be excluded by this rule's own
+// allowlist while running the exact flow the rule exists to catch.
+//
+// Populate from your own tenant rather than from a published list:
+//   SigninLogs
+//   | where AppDisplayName in ("Microsoft Office", "Azure Portal", "Microsoft Teams", "Outlook Mobile")
+//   | summarize SeenAs = make_set(AppDisplayName) by AppId
+//
+// Left empty deliberately. An unfilled allowlist suppresses nothing, so the rule
+// is noisier rather than blind; a wrong GUID pasted in from memory would be worse.
+let ApprovedAppIds = dynamic([
+    // "00000000-0000-0000-0000-000000000000",  // Microsoft Office
+    // "00000000-0000-0000-0000-000000000000",  // Azure Portal
+    // "00000000-0000-0000-0000-000000000000",  // Microsoft Teams
+    // "00000000-0000-0000-0000-000000000000"   // Outlook Mobile
+]);
 SigninLogs
-| where ResultType in ("65001","65004","70011","700016","70000","7000218","AADSTS65001","AADSTS65004","AADSTS70011","AADSTS700016")
+| where TimeGenerated > ago(1d)
+| where ResultType in (
+    "65001",   // User or administrator has not consented; interaction is required
+    "65004",   // User declined consent
+    "70011",   // Invalid scope or other OAuth parameter issue
+    "70000",   // Invalid grant; broad authentication-flow failure
+    "700016",  // Application not found in tenant
+    "7000218", // Request body must contain client_assertion or client_secret
+    "AADSTS65001",
+    "AADSTS65004",
+    "AADSTS70011",
+    "AADSTS700016"
+)
+| extend AppName = AppDisplayName
 | extend AppIdUsed = AppId
 | where isempty(AppIdUsed) or AppIdUsed !in~ (ApprovedAppIds)
-| summarize ErrorCount = count(), DistinctUsers = dcount(UserPrincipalName), Users = make_set(UserPrincipalName, 10), ErrorCodes = make_set(ResultType), IPs = make_set(IPAddress, 10) by AppDisplayName, AppId, bin(TimeGenerated, 1h)
+| summarize
+    ErrorCount = count(),
+    DistinctUsers = dcount(UserPrincipalName),
+    Users = make_set(UserPrincipalName, 10),
+    ErrorCodes = make_set(ResultType),
+    IPs = make_set(IPAddress, 10)
+    by AppName, AppIdUsed, bin(TimeGenerated, 1h)
 | where ErrorCount > 3 or DistinctUsers > 2
-| project TimeGenerated, AppDisplayName, AppId, ErrorCount, DistinctUsers, Users, ErrorCodes, IPs
+| project
+    TimeGenerated,
+    AppName,
+    AppIdUsed,
+    ErrorCount,
+    DistinctUsers,
+    Users,
+    ErrorCodes,
+    IPs
 "@
         tactics        = @()
         techniques     = @()
@@ -201,14 +270,28 @@ SigninLogs
         description = "Detects when multiple users consent to the same OAuth app within a short window, indicating a phishing campaign."
         severity    = "High"
         query       = @"
+let ConsentThreshold = 3;
+let TimeWindow = 1h;
 AuditLogs
+| where TimeGenerated > ago(1d)
 | where OperationName == "Consent to application"
 | extend ConsentUser = tostring(InitiatedBy.user.userPrincipalName)
-| extend AppName = tostring(TargetResources[0].displayName)
+| extend AppDisplayName = tostring(TargetResources[0].displayName)
 | extend AppId = tostring(TargetResources[0].id)
-| summarize ConsentCount = count(), ConsentUsers = make_set(ConsentUser, 20), FirstConsent = min(TimeGenerated), LastConsent = max(TimeGenerated) by AppName, AppId, bin(TimeGenerated, 1h)
-| where ConsentCount >= 3
-| project TimeGenerated, AppName, AppId, ConsentCount, ConsentUsers
+| summarize
+    ConsentCount = count(),
+    ConsentUsers = make_set(ConsentUser, 20),
+    FirstConsent = min(TimeGenerated),
+    LastConsent = max(TimeGenerated)
+    by AppDisplayName, AppId, bin(TimeGenerated, TimeWindow)
+| where ConsentCount >= ConsentThreshold
+| project
+    TimeGenerated,
+    AppDisplayName,
+    AppId,
+    ConsentCount,
+    ConsentUsers,
+    ConsentWindow = LastConsent - FirstConsent
 "@
         tactics        = @("InitialAccess")
         techniques     = @("T1566")
