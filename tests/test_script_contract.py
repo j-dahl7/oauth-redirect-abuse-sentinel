@@ -52,8 +52,14 @@ class OAuthScriptContractTests(unittest.TestCase):
             2,
         )
         self.assertNotIn("AppDisplayName !in (", script)
-        self.assertIn('techniques     = @("T1566", "T1204")', script)
-        self.assertIn('subTechniques  = @("T1566.002", "T1204.001")', script)
+        self.assertIn('displayName        = "LAB - OAuth Error Cluster by Application"', script)
+        self.assertIn('resourceKey        = "rule:LAB - OAuth Error-Based Redirect Pattern"', script)
+        self.assertIn('legacyDisplayNames = @("LAB - OAuth Error-Based Redirect Pattern")', script)
+        self.assertIn('severity    = "Medium"', script)
+        self.assertIn('tactics        = @()', script)
+        self.assertIn('techniques     = @()', script)
+        self.assertIn('subTechniques  = @()', script)
+        self.assertIn('$allowedDisplayNames -cnotcontains $existingDisplayName', script)
 
     def test_hunts_never_trust_application_display_names(self):
         hunts = (ROOT / "detection" / "hunting-queries.kql").read_text(
@@ -76,7 +82,14 @@ class OAuthScriptContractTests(unittest.TestCase):
             self.assertIn("parse_json(NewRedirectUris)", source)
             self.assertIn("parse_url(RedirectUri)", source)
             self.assertIn("RedirectHost matches regex SuspiciousHostRegex", source)
-            self.assertIn('RedirectScheme == "http"', source)
+            self.assertIn(
+                'let ApprovedHttpLoopbackHosts = dynamic(["localhost", "127.0.0.1"]);',
+                source,
+            )
+            self.assertIn(
+                'RedirectScheme == "http" and RedirectHost !in~ (ApprovedHttpLoopbackHosts)',
+                source,
+            )
             self.assertNotIn("NewRedirectUris has_any", source)
             self.assertNotIn('NewRedirectUris has "http://"', source)
 

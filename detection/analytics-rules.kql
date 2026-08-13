@@ -47,6 +47,7 @@ AuditLogs
 // -----------------------------------------------------------------------------
 // Match exact hosts or their subdomains after parsing each absolute redirect URI.
 let SuspiciousHostRegex = @"^([a-z0-9-]+\.)*(ngrok\.io|ngrok-free\.app|trycloudflare\.com|serveo\.net|localtunnel\.me|workers\.dev|pages\.dev|herokuapp\.com|netlify\.app|vercel\.app|github\.io|gitlab\.io|surge\.sh|glitch\.me|replit\.dev|powerappsportals\.com|webhook\.site|requestbin\.com|pipedream\.com|bit\.ly|tinyurl\.com|t\.co|rebrand\.ly)$";
+let ApprovedHttpLoopbackHosts = dynamic(["localhost", "127.0.0.1"]);
 AuditLogs
 | where TimeGenerated > ago(1d)
 | where OperationName in ("Add application", "Update application")
@@ -64,7 +65,7 @@ AuditLogs
 | extend AppName = tostring(TargetResources[0].displayName)
 | extend AppObjectId = tostring(TargetResources[0].id)
 | where RedirectHost matches regex SuspiciousHostRegex
-    or RedirectScheme == "http" // non-HTTPS redirects
+    or (RedirectScheme == "http" and RedirectHost !in~ (ApprovedHttpLoopbackHosts))
 | project
     TimeGenerated,
     OperationName,
@@ -77,20 +78,17 @@ AuditLogs
     InitiatedByApp
 
 // -----------------------------------------------------------------------------
-// RULE 3: OAuth Error-Based Redirect to External URL
-// Severity: High
-// MITRE: T1566.002 (Spearphishing Link), T1204.001 (User Execution: Malicious Link)
-// Description: Detects sign-in attempts to OAuth applications that result in
-//   the Entra errors most closely associated with redirect abuse. The strongest
-//   signals are 65001 and 65004. Additional OAuth failures are included as
-//   supporting context when they cluster around the same app and time window.
-//
-// High-confidence signals:
-//   65001 - User has not consented (interaction_required). Primary prompt=none signal.
-//   65004 - User actively declined consent (access_denied).
-// Supporting context:
-//   70011, 700016, 70000, 7000218 - broader OAuth failures that may show up
-//   when an attacker or a broken app probes the same flow.
+// RULE 3: OAuth Error Cluster by Application
+// Severity: Medium
+// MITRE: none. SigninLogs error codes alone do not prove a phishing redirect
+//   or user execution, so this rule is an investigation lead rather than an
+//   ATT&CK-attributed detection.
+// Description: Groups repeated consent, scope, app-registration, grant, and
+//   client-authentication failures by application. These errors can occur in
+//   redirect-abuse investigations, but they are also produced by legitimate
+//   consent state and broken application configuration. Correlate the result
+//   with redirect-URI changes, consent events, application ownership, and risk
+//   telemetry before treating it as malicious.
 // -----------------------------------------------------------------------------
 // Immutable application IDs only - display names are attacker-controlled and
 // Entra does not reserve first-party names, so an attacker can register a
@@ -113,10 +111,10 @@ let ApprovedAppIds = dynamic([
 SigninLogs
 | where TimeGenerated > ago(1d)
 | where ResultType in (
-    "65001",   // User has not consented (prompt=none attack vector)
+    "65001",   // User or administrator has not consented; interaction is required
     "65004",   // User declined consent
     "70011",   // Invalid scope or other OAuth parameter issue
-    "70000",   // InvalidGrant
+    "70000",   // Invalid grant; broad authentication-flow failure
     "700016",  // Application not found in tenant
     "7000218", // Request body must contain client_assertion or client_secret
     "AADSTS65001",

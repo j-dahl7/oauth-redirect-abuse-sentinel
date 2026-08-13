@@ -152,15 +152,15 @@ Correlates `SigninLogs` risk indicators with `AuditLogs` consent events within a
 
 ### Rule 2: Suspicious OAuth Redirect URI Registered (Medium)
 
-Watches for app registrations adding redirect URIs to tunneling services, free hosting, URL shorteners, or non-HTTPS endpoints.
+Watches for app registrations adding redirect URIs to tunneling services, free hosting, URL shorteners, or non-HTTPS endpoints. It exempts the exact `localhost` and `127.0.0.1` HTTP loopback hosts that Microsoft supports for local application development; other HTTP hosts remain suspicious.
 
 **MITRE:** T1098 (Account Manipulation)
 
-### Rule 3: OAuth Error-Based Redirect Pattern (High)
+### Rule 3: OAuth Error Cluster by Application (Medium)
 
-Detects the Entra errors most closely associated with redirect abuse. The strongest signals are `AADSTS65001` and `AADSTS65004`; additional OAuth failures are included as supporting context when they cluster around the same app and time window.
+Groups repeated consent, scope, app-registration, grant, and client-authentication failures by application. These errors can appear during redirect-abuse investigations, but they can also reflect ordinary consent state or broken application configuration. Treat the result as a triage lead and correlate it with redirect-URI changes, consent events, application ownership, and sign-in risk. The error cluster alone does not prove a redirect.
 
-**MITRE:** T1566.002 (Spearphishing Link), T1204.001 (User Execution: Malicious Link)
+**MITRE:** None assigned. `SigninLogs` error codes alone do not establish phishing-link delivery or user execution.
 
 ### Rule 4: Bulk OAuth Consent to Single App (High)
 
