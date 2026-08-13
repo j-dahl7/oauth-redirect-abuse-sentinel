@@ -46,7 +46,8 @@ class OAuthScriptContractTests(unittest.TestCase):
     def test_deployed_oauth_rule_and_workbook_use_immutable_app_ids(self):
         script = (ROOT / "scripts" / "Deploy-Lab.ps1").read_text(encoding="utf-8")
 
-        self.assertGreaterEqual(script.count("let ApprovedAppIds = dynamic([]);"), 2)
+        self.assertIn("let ApprovedAppIds = dynamic([", script)
+        self.assertIn('"query": "let ApprovedAppIds = dynamic([]);', script)
         self.assertGreaterEqual(
             script.count("AppIdUsed !in~ (ApprovedAppIds)"),
             2,
@@ -92,6 +93,31 @@ class OAuthScriptContractTests(unittest.TestCase):
             )
             self.assertNotIn("NewRedirectUris has_any", source)
             self.assertNotIn('NewRedirectUris has "http://"', source)
+
+    def test_standalone_queries_match_the_deployed_queries(self):
+        standalone = (ROOT / "detection" / "analytics-rules.kql").read_text(
+            encoding="utf-8"
+        ).replace("\r\n", "\n")
+        deployed = (ROOT / "scripts" / "Deploy-Lab.ps1").read_text(
+            encoding="utf-8"
+        ).replace("\r\n", "\n")
+
+        standalone_queries = []
+        for section in standalone.split("// RULE ")[1:]:
+            query = section.split(
+                "// -----------------------------------------------------------------------------\n",
+                1,
+            )[1]
+            standalone_queries.append(query.rsplit("\n// -----------------------------------------------------------------------------", 1)[0].strip())
+
+        deployed_queries = [
+            match.replace("`$", "$").strip()
+            for match in __import__("re").findall(
+                r'query\s+=\s+@"\n([\s\S]*?)\n"@', deployed
+            )
+        ]
+        self.assertEqual(len(standalone_queries), 4)
+        self.assertEqual(deployed_queries, standalone_queries)
 
     def test_every_workbook_query_is_bound_to_the_time_range_parameter(self):
         script = (ROOT / "scripts" / "Deploy-Lab.ps1").read_text(encoding="utf-8")
