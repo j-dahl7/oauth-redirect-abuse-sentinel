@@ -1,7 +1,9 @@
+import json
 import os
 import shutil
 import subprocess
 import textwrap
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -10,23 +12,36 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OAuthScriptContractTests(unittest.TestCase):
-    def test_hardening_preview_uses_planned_summaries_and_scoped_temp_files(self):
+    def test_hardening_has_manifest_ownership_and_no_update_by_name(self):
         script = (ROOT / "hardening" / "Set-OAuthHardening.ps1").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn("$consentSummary = 'Planned restriction", script)
-        self.assertIn("$caSummary = 'Planned report-only", script)
+        self.assertIn("function Write-OwnerOnlyManifest", script)
+        self.assertIn("function Assert-OwnedPolicyUnchanged", script)
+        self.assertIn("Assert-NoForeignNameCollision", script)
+        self.assertIn("function Get-AllConditionalAccessPolicies", script)
+        self.assertIn("@odata.nextLink", script)
+        self.assertIn("servicePrincipalFilterRule", script)
+        self.assertIn("includeExternalTenantIds", script)
+        self.assertIn("-ConfirmTenantId", script)
+        self.assertIn("Apply requires at least one reviewed emergency-access", script)
+        self.assertIn("A prior CA create request has an uncertain outcome", script)
+        self.assertIn("Write-OwnerOnlyManifest -Manifest $manifest", script)
         self.assertIn("function Invoke-GraphJsonRequest", script)
         self.assertIn("finally {", script)
         self.assertEqual(script.count("New-TemporaryFile"), 1)
-        self.assertNotIn("CA policy: Report-only MFA step-up policy created", script)
+        self.assertNotIn("Update policy:", script)
+        self.assertNotIn("-Method PATCH `\n                -Url \"$ConditionalAccessPoliciesUrl/", script)
 
     def test_deploy_forwards_emergency_access_exclusions(self):
         script = (ROOT / "scripts" / "Deploy-Lab.ps1").read_text(encoding="utf-8")
 
         self.assertIn("[string[]]$ExcludedUserIds = @()", script)
         self.assertIn("-ExcludedUserIds $ExcludedUserIds", script)
+        self.assertIn("[string]$ConfirmTenantId", script)
+        self.assertIn("-ConfirmTenantId $ConfirmTenantId", script)
+        self.assertIn("-ManifestPath $HardeningManifestPath", script)
 
     def test_deploy_uses_deterministic_ids_and_explicit_ownership(self):
         script = (ROOT / "scripts" / "Deploy-Lab.ps1").read_text(encoding="utf-8")
@@ -80,7 +95,10 @@ class OAuthScriptContractTests(unittest.TestCase):
         )
 
         for source in (standalone, deployed):
-            self.assertIn("parse_json(NewRedirectUris)", source)
+            self.assertIn("tostring(NewAddressItem.Address)", source)
+            self.assertIn('gettype(NewAddressItem) == "string"', source)
+            self.assertIn("set_difference(NewRedirectUris, OldRedirectUris)", source)
+            self.assertIn("mv-expand RedirectUri = AddedRedirectUris", source)
             self.assertIn("parse_url(RedirectUri)", source)
             self.assertIn("RedirectHost matches regex SuspiciousHostRegex", source)
             self.assertIn(
@@ -93,6 +111,61 @@ class OAuthScriptContractTests(unittest.TestCase):
             )
             self.assertNotIn("NewRedirectUris has_any", source)
             self.assertNotIn('NewRedirectUris has "http://"', source)
+
+    def test_redirect_normalization_fixtures_cover_object_and_legacy_shapes(self):
+        cases = json.loads(
+            (ROOT / "tests" / "fixtures" / "appaddress-modifications.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        def normalize(items):
+            values = set()
+            for item in items or []:
+                if isinstance(item, dict):
+                    value = item.get("Address", "")
+                elif isinstance(item, str):
+                    value = item
+                else:
+                    value = ""
+                if value:
+                    values.add(value)
+            return values
+
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                added = normalize(case["newValue"]) - normalize(case["oldValue"])
+                self.assertEqual(sorted(added), sorted(case["expectedAdded"]))
+
+    def test_bulk_consent_uses_distinct_nonempty_immutable_users(self):
+        standalone = (ROOT / "detection" / "analytics-rules.kql").read_text(
+            encoding="utf-8"
+        )
+        deployed = (ROOT / "scripts" / "Deploy-Lab.ps1").read_text(
+            encoding="utf-8"
+        )
+        for source in (standalone, deployed):
+            self.assertIn("tostring(InitiatedBy.user.id)", source)
+            self.assertIn("where isnotempty(ConsentUserId)", source)
+            self.assertIn("ConsentEventCount = count()", source)
+            self.assertIn("DistinctConsentUsers = dcount(ConsentUserId)", source)
+            self.assertIn(
+                "where DistinctConsentUsers >= ConsentUserThreshold", source
+            )
+            self.assertNotIn("where ConsentCount >= ConsentThreshold", source)
+
+        cases = json.loads(
+            (ROOT / "tests" / "fixtures" / "bulk-consent-events.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        for case in cases:
+            retained = [event for event in case["events"] if event.get("userId")]
+            distinct = {event["userId"].lower() for event in retained}
+            with self.subTest(case=case["name"]):
+                self.assertEqual(len(retained), case["expectedEventCount"])
+                self.assertEqual(len(distinct), case["expectedDistinctUsers"])
+                self.assertEqual(len(distinct) >= 3, case["expectedAlert"])
 
     def test_standalone_queries_match_the_deployed_queries(self):
         standalone = (ROOT / "detection" / "analytics-rules.kql").read_text(
@@ -370,10 +443,15 @@ class OAuthScriptContractTests(unittest.TestCase):
         harness = textwrap.dedent(
             r"""
             $ErrorActionPreference = 'Stop'
+            $tenantId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            $manifestPath = Join-Path $env:OAUTH_TEST_DIR 'preview-manifest.json'
             function global:az {
                 $request = $args -join ' '
+                if ($request -match '^account show') {
+                    return (@{ tenantId = $tenantId } | ConvertTo-Json -Compress)
+                }
                 if ($request -match 'policies/authorizationPolicy') {
-                    '{"defaultUserRolePermissions":{"permissionGrantPoliciesAssigned":[]}}'
+                    return '{"id":"authorizationPolicy","defaultUserRolePermissions":{"permissionGrantPoliciesAssigned":[]}}'
                     return
                 }
                 if ($request -match 'identity/conditionalAccess/policies') {
@@ -386,30 +464,374 @@ class OAuthScriptContractTests(unittest.TestCase):
                 throw 'WhatIf attempted to create a temporary file'
             }
 
-            $output = & $env:OAUTH_HARDENING_SCRIPT -WhatIf 6>&1 | Out-String
-            if ($output -notmatch 'Planned restriction to verified publishers') {
-                throw "Preview consent summary was missing: $output"
+            $output = & $env:OAUTH_HARDENING_SCRIPT `
+                -ManifestPath $manifestPath -WhatIf 6>&1 | Out-String
+            if ($output -notmatch 'Would persist owner-only manifest') {
+                throw "Preview manifest summary was missing: $output"
             }
-            if ($output -notmatch 'Planned report-only MFA policy creation') {
+            if ($output -notmatch 'Would create, never adopt, one report-only CA policy') {
                 throw "Preview CA summary was missing: $output"
             }
-            if ($output -match 'User consent: Restricted') {
-                throw "Preview falsely reported an applied consent restriction: $output"
+            if (Test-Path -LiteralPath $manifestPath) {
+                throw 'Preview wrote an ownership manifest'
             }
             "OK"
             """
         )
-        env = os.environ.copy()
-        env["OAUTH_HARDENING_SCRIPT"] = str(
-            ROOT / "hardening" / "Set-OAuthHardening.ps1"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = os.environ.copy()
+            env["OAUTH_TEST_DIR"] = temp_dir
+            env["OAUTH_HARDENING_SCRIPT"] = str(
+                ROOT / "hardening" / "Set-OAuthHardening.ps1"
+            )
+            result = subprocess.run(
+                ["pwsh", "-NoLogo", "-NoProfile", "-Command", harness],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("OK", result.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is not available")
+    def test_hardening_rejects_foreign_policy_before_writes(self):
+        harness = textwrap.dedent(
+            r"""
+            $ErrorActionPreference = 'Stop'
+            $tenantId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            $excludedId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+            $global:mutations = @()
+            function global:az {
+                $request = $args -join ' '
+                if ($request -match '--method (POST|PATCH|DELETE)') {
+                    $global:mutations += $request
+                    throw 'A mutation should not occur'
+                }
+                if ($request -match '^account show') {
+                    return (@{ tenantId = $tenantId } | ConvertTo-Json -Compress)
+                }
+                if ($request -match 'policies/authorizationPolicy') {
+                    return '{"id":"authorizationPolicy","defaultUserRolePermissions":{"permissionGrantPoliciesAssigned":[]}}'
+                }
+                if ($request -match 'identity/conditionalAccess/policies') {
+                    return '{"value":[{"id":"foreign-policy-id","displayName":"LAB - Require MFA for Risky OAuth Sign-ins","state":"enabled"}]}'
+                }
+                throw "Unexpected mocked az call: $request"
+            }
+
+            $message = ''
+            try {
+                & $env:OAUTH_HARDENING_SCRIPT `
+                    -ConfirmTenantId $tenantId `
+                    -ExcludedUserIds @($excludedId) `
+                    -ManifestPath (Join-Path $env:OAUTH_TEST_DIR 'manifest.json') 6>&1
+            } catch {
+                $message = $_.Exception.Message
+            }
+            if ($message -notmatch 'Refusing to adopt or overwrite') {
+                throw "Foreign policy was not rejected: $message"
+            }
+            if ($global:mutations.Count -ne 0) {
+                throw "Foreign collision caused mutations: $($global:mutations -join '; ')"
+            }
+            "OK"
+            """
         )
-        result = subprocess.run(
-            ["pwsh", "-NoLogo", "-NoProfile", "-Command", harness],
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = os.environ.copy()
+            env["OAUTH_TEST_DIR"] = temp_dir
+            env["OAUTH_HARDENING_SCRIPT"] = str(
+                ROOT / "hardening" / "Set-OAuthHardening.ps1"
+            )
+            result = subprocess.run(
+                ["pwsh", "-NoLogo", "-NoProfile", "-Command", harness],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("OK", result.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is not available")
+    def test_hardening_fails_closed_on_confirmation_and_exclusions(self):
+        harness = textwrap.dedent(
+            r"""
+            $ErrorActionPreference = 'Stop'
+            $tenantId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            $global:mutations = @()
+            function global:az {
+                $request = $args -join ' '
+                if ($request -match '--method (POST|PATCH|DELETE)') {
+                    $global:mutations += $request
+                    throw 'A mutation should not occur'
+                }
+                if ($request -match '^account show') {
+                    return (@{ tenantId = $tenantId } | ConvertTo-Json -Compress)
+                }
+                if ($request -match 'policies/authorizationPolicy') {
+                    return '{"id":"authorizationPolicy","defaultUserRolePermissions":{"permissionGrantPoliciesAssigned":[]}}'
+                }
+                if ($request -match 'identity/conditionalAccess/policies') {
+                    return '{"value":[]}'
+                }
+                throw "Unexpected mocked az call: $request"
+            }
+
+            $wrongTenantMessage = ''
+            try {
+                & $env:OAUTH_HARDENING_SCRIPT `
+                    -ConfirmTenantId 'dddddddd-dddd-dddd-dddd-dddddddddddd' `
+                    -ExcludedUserIds @('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb') `
+                    -ManifestPath (Join-Path $env:OAUTH_TEST_DIR 'wrong-tenant.json') 6>&1
+            } catch {
+                $wrongTenantMessage = $_.Exception.Message
+            }
+            if ($wrongTenantMessage -notmatch 'Tenant confirmation failed') {
+                throw "Wrong tenant confirmation was not rejected: $wrongTenantMessage"
+            }
+
+            $exclusionMessage = ''
+            try {
+                & $env:OAUTH_HARDENING_SCRIPT `
+                    -ConfirmTenantId $tenantId `
+                    -ExcludedUserIds @() `
+                    -ManifestPath (Join-Path $env:OAUTH_TEST_DIR 'empty-exclusions.json') 6>&1
+            } catch {
+                $exclusionMessage = $_.Exception.Message
+            }
+            if ($exclusionMessage -notmatch 'requires at least one reviewed emergency-access') {
+                throw "Empty exclusions were not rejected: $exclusionMessage"
+            }
+            if ($global:mutations.Count -ne 0) {
+                throw "Failed confirmation/exclusions caused mutations: $($global:mutations -join '; ')"
+            }
+            "OK"
+            """
         )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = os.environ.copy()
+            env["OAUTH_TEST_DIR"] = temp_dir
+            env["OAUTH_HARDENING_SCRIPT"] = str(
+                ROOT / "hardening" / "Set-OAuthHardening.ps1"
+            )
+            result = subprocess.run(
+                ["pwsh", "-NoLogo", "-NoProfile", "-Command", harness],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("OK", result.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is not available")
+    def test_hardening_apply_partial_failure_compensates_and_records_state(self):
+        harness = textwrap.dedent(
+            r"""
+            $ErrorActionPreference = 'Stop'
+            $tenantId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            $excludedId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+            $createdId = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
+            $manifestPath = Join-Path $env:OAUTH_TEST_DIR 'manifest.json'
+            $global:mutations = @()
+            $global:createdBody = $null
+            function global:az {
+                $request = $args -join ' '
+                if ($request -match '^account show') {
+                    return (@{ tenantId = $tenantId } | ConvertTo-Json -Compress)
+                }
+                if ($request -match '--method GET' -and $request -match 'policies/authorizationPolicy') {
+                    return '{"id":"authorizationPolicy","defaultUserRolePermissions":{"permissionGrantPoliciesAssigned":["legacy-policy"]}}'
+                }
+                if ($request -match '--method POST') {
+                    $global:mutations += 'POST'
+                    $bodyArg = @($args | Where-Object { $_ -like '@*' })[0]
+                    $global:createdBody = Get-Content -LiteralPath $bodyArg.Substring(1) -Raw | ConvertFrom-Json
+                    return (@{ id = $createdId; displayName = 'LAB - Require MFA for Risky OAuth Sign-ins' } | ConvertTo-Json -Compress)
+                }
+                if ($request -match '--method PATCH') {
+                    $global:mutations += 'PATCH'
+                    throw 'simulated consent update failure'
+                }
+                if ($request -match '--method GET' -and $request -match [regex]::Escape($createdId)) {
+                    $policy = $global:createdBody
+                    $policy | Add-Member -NotePropertyName id -NotePropertyValue $createdId
+                    return ($policy | ConvertTo-Json -Depth 20 -Compress)
+                }
+                if ($request -match '--method GET' -and $request -match 'identity/conditionalAccess/policies') {
+                    return '{"value":[]}'
+                }
+                if ($request -match '--method DELETE' -and $request -match [regex]::Escape($createdId)) {
+                    $global:mutations += 'DELETE'
+                    return ''
+                }
+                throw "Unexpected mocked az call: $request"
+            }
+
+            $message = ''
+            try {
+                & $env:OAUTH_HARDENING_SCRIPT `
+                    -ConfirmTenantId $tenantId `
+                    -ExcludedUserIds @($excludedId) `
+                    -ManifestPath $manifestPath 6>&1
+            } catch {
+                $message = $_.Exception.Message
+            }
+            if ($message -notmatch 'simulated consent update failure') {
+                throw "Expected partial failure was not surfaced: $message"
+            }
+            if (($global:mutations -join ',') -ne 'POST,PATCH,DELETE') {
+                throw "Expected compensating mutation order, got: $($global:mutations -join ',')"
+            }
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            if ($manifest.state -ne 'prepared' -or $manifest.conditionalAccess.id) {
+                throw "Compensated state was not durable: $($manifest | ConvertTo-Json -Depth 10 -Compress)"
+            }
+            if ($manifest.removedPolicyIds -notcontains $createdId) {
+                throw 'Manifest did not retain the compensated CA policy ID'
+            }
+            "OK"
+            """
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = os.environ.copy()
+            env["OAUTH_TEST_DIR"] = temp_dir
+            env["OAUTH_HARDENING_SCRIPT"] = str(
+                ROOT / "hardening" / "Set-OAuthHardening.ps1"
+            )
+            result = subprocess.run(
+                ["pwsh", "-NoLogo", "-NoProfile", "-Command", harness],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("OK", result.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is not available")
+    def test_hardening_rerun_and_rollback_require_exact_undrifted_id(self):
+        harness = textwrap.dedent(
+            r"""
+            $ErrorActionPreference = 'Stop'
+            $tenantId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            $excludedId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+            $createdId = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
+            $manifestPath = Join-Path $env:OAUTH_TEST_DIR 'manifest.json'
+            $global:originalConsent = @('legacy-policy')
+            $global:currentConsent = @($global:originalConsent)
+            $global:policy = $null
+            $global:mutations = @()
+
+            function global:az {
+                $request = $args -join ' '
+                if ($request -match '^account show') {
+                    return (@{ tenantId = $tenantId } | ConvertTo-Json -Compress)
+                }
+                if ($request -match '--method GET' -and $request -match 'policies/authorizationPolicy') {
+                    return (@{
+                        id = 'authorizationPolicy'
+                        defaultUserRolePermissions = @{
+                            permissionGrantPoliciesAssigned = @($global:currentConsent)
+                        }
+                    } | ConvertTo-Json -Depth 8 -Compress)
+                }
+                if ($request -match '--method GET' -and $request -match [regex]::Escape($createdId)) {
+                    return ($global:policy | ConvertTo-Json -Depth 20 -Compress)
+                }
+                if ($request -match '--method GET' -and $request -match 'identity/conditionalAccess/policies') {
+                    $values = if ($global:policy) { @($global:policy) } else { @() }
+                    return (@{ value = $values } | ConvertTo-Json -Depth 20 -Compress)
+                }
+                if ($request -match '--method POST') {
+                    $global:mutations += 'POST'
+                    $bodyArg = @($args | Where-Object { $_ -like '@*' })[0]
+                    $global:policy = Get-Content -LiteralPath $bodyArg.Substring(1) -Raw | ConvertFrom-Json
+                    $global:policy | Add-Member -NotePropertyName id -NotePropertyValue $createdId
+                    return (@{ id = $createdId; displayName = $global:policy.displayName } | ConvertTo-Json -Compress)
+                }
+                if ($request -match '--method PATCH' -and $request -match 'authorizationPolicy') {
+                    $global:mutations += 'PATCH-CONSENT'
+                    $bodyArg = @($args | Where-Object { $_ -like '@*' })[0]
+                    $body = Get-Content -LiteralPath $bodyArg.Substring(1) -Raw | ConvertFrom-Json
+                    $global:currentConsent = @($body.defaultUserRolePermissions.permissionGrantPoliciesAssigned)
+                    return '{}'
+                }
+                if ($request -match '--method DELETE' -and $request -match [regex]::Escape($createdId)) {
+                    $global:mutations += 'DELETE-CA'
+                    $global:policy = $null
+                    return ''
+                }
+                throw "Unexpected mocked az call: $request"
+            }
+
+            & $env:OAUTH_HARDENING_SCRIPT `
+                -ConfirmTenantId $tenantId `
+                -ExcludedUserIds @($excludedId) `
+                -ManifestPath $manifestPath 6>&1 | Out-Null
+            if (($global:mutations -join ',') -ne 'POST,PATCH-CONSENT') {
+                throw "Initial apply mutations were wrong: $($global:mutations -join ',')"
+            }
+
+            $global:mutations = @()
+            & $env:OAUTH_HARDENING_SCRIPT `
+                -ConfirmTenantId $tenantId `
+                -ExcludedUserIds @($excludedId) `
+                -ManifestPath $manifestPath 6>&1 | Out-Null
+            if ($global:mutations.Count -ne 0) {
+                throw "Idempotent rerun mutated cloud state: $($global:mutations -join ',')"
+            }
+
+            $global:policy.state = 'enabled'
+            $driftMessage = ''
+            try {
+                & $env:OAUTH_HARDENING_SCRIPT `
+                    -ConfirmTenantId $tenantId `
+                    -ManifestPath $manifestPath `
+                    -Rollback 6>&1 | Out-Null
+            } catch {
+                $driftMessage = $_.Exception.Message
+            }
+            if ($driftMessage -notmatch 'drifted from the manifest-intended content') {
+                throw "Rollback did not reject CA drift: $driftMessage"
+            }
+            if ($global:mutations.Count -ne 0) {
+                throw 'Drifted rollback caused a mutation'
+            }
+
+            $global:policy.state = 'enabledForReportingButNotEnforced'
+            & $env:OAUTH_HARDENING_SCRIPT `
+                -ConfirmTenantId $tenantId `
+                -ManifestPath $manifestPath `
+                -Rollback 6>&1 | Out-Null
+            if (($global:mutations -join ',') -ne 'PATCH-CONSENT,DELETE-CA') {
+                throw "Exact rollback mutations were wrong: $($global:mutations -join ',')"
+            }
+            if (($global:currentConsent -join ',') -ne ($global:originalConsent -join ',')) {
+                throw 'Rollback did not restore the exact captured consent collection'
+            }
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            if ($manifest.state -ne 'rolled-back') {
+                throw "Rollback state was not durable: $($manifest.state)"
+            }
+            "OK"
+            """
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = os.environ.copy()
+            env["OAUTH_TEST_DIR"] = temp_dir
+            env["OAUTH_HARDENING_SCRIPT"] = str(
+                ROOT / "hardening" / "Set-OAuthHardening.ps1"
+            )
+            result = subprocess.run(
+                ["pwsh", "-NoLogo", "-NoProfile", "-Command", harness],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn("OK", result.stdout)
 
