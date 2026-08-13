@@ -27,10 +27,25 @@ class OAuthScriptContractTests(unittest.TestCase):
         self.assertIn("-ConfirmTenantId", script)
         self.assertIn("Apply requires at least one reviewed emergency-access", script)
         self.assertIn("neither apply nor rollback can continue", script)
+        self.assertIn("CA-policy creation was declined", script)
+        self.assertIn("Consent-policy update was declined", script)
+        self.assertIn("CA-policy deletion was declined", script)
+        self.assertIn("$verifiedAuthorizationPolicy = Get-AuthorizationPolicy", script)
+        self.assertIn("$preRestoreAuthorizationPolicy = Get-AuthorizationPolicy", script)
         self.assertIn("Write-OwnerOnlyManifest -Manifest $manifest", script)
         self.assertIn("function Invoke-GraphJsonRequest", script)
         self.assertIn("finally {", script)
         self.assertEqual(script.count("New-TemporaryFile"), 1)
+        permission_lock = script.index("Set-OwnerOnlyFilePermissions $temporaryPath")
+        manifest_write = script.index("$manifestWriter.Write($json)")
+        self.assertLess(permission_lock, manifest_write)
+        body_permission_lock = script.index(
+            "Set-OwnerOnlyFilePermissions $bodyFile.FullName"
+        )
+        body_write = script.index(
+            "[System.IO.File]::WriteAllText(\n            $bodyFile.FullName"
+        )
+        self.assertLess(body_permission_lock, body_write)
         self.assertNotIn("Update policy:", script)
         self.assertNotIn("-Method PATCH `\n                -Url \"$ConditionalAccessPoliciesUrl/", script)
 
@@ -657,7 +672,7 @@ class OAuthScriptContractTests(unittest.TestCase):
                 }
                 if ($request -match '--method GET' -and $request -match [regex]::Escape($createdId)) {
                     $policy = $global:createdBody
-                    $policy | Add-Member -NotePropertyName id -NotePropertyValue $createdId
+                    $policy | Add-Member -NotePropertyName id -NotePropertyValue $createdId -Force
                     return ($policy | ConvertTo-Json -Depth 20 -Compress)
                 }
                 if ($request -match '--method GET' -and $request -match 'identity/conditionalAccess/policies') {
@@ -691,6 +706,76 @@ class OAuthScriptContractTests(unittest.TestCase):
             }
             if ($manifest.removedPolicyIds -notcontains $createdId) {
                 throw 'Manifest did not retain the compensated CA policy ID'
+            }
+            "OK"
+            """
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = os.environ.copy()
+            env["OAUTH_TEST_DIR"] = temp_dir
+            env["OAUTH_HARDENING_SCRIPT"] = str(
+                ROOT / "hardening" / "Set-OAuthHardening.ps1"
+            )
+            result = subprocess.run(
+                ["pwsh", "-NoLogo", "-NoProfile", "-Command", harness],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("OK", result.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is not available")
+    def test_existing_intended_consent_is_case_insensitive_and_not_rewritten(self):
+        harness = textwrap.dedent(
+            r"""
+            $ErrorActionPreference = 'Stop'
+            $tenantId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            $excludedId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+            $createdId = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
+            $manifestPath = Join-Path $env:OAUTH_TEST_DIR 'manifest.json'
+            $global:policy = $null
+            $global:mutations = @()
+            function global:az {
+                $request = $args -join ' '
+                if ($request -match '^account show') {
+                    return (@{ tenantId = $tenantId } | ConvertTo-Json -Compress)
+                }
+                if ($request -match '--method GET' -and $request -match 'policies/authorizationPolicy') {
+                    return '{"id":"authorizationPolicy","defaultUserRolePermissions":{"permissionGrantPoliciesAssigned":["ManagePermissionGrantsForSelf.microsoft-user-default-low"]}}'
+                }
+                if ($request -match '--method GET' -and $request -match [regex]::Escape($createdId)) {
+                    return ($global:policy | ConvertTo-Json -Depth 20 -Compress)
+                }
+                if ($request -match '--method GET' -and $request -match 'identity/conditionalAccess/policies') {
+                    $values = if ($global:policy) { @($global:policy) } else { @() }
+                    return (@{ value = $values } | ConvertTo-Json -Depth 20 -Compress)
+                }
+                if ($request -match '--method POST') {
+                    $global:mutations += 'POST'
+                    $bodyArg = @($args | Where-Object { $_ -like '@*' })[0]
+                    $global:policy = Get-Content -LiteralPath $bodyArg.Substring(1) -Raw | ConvertFrom-Json
+                    $global:policy | Add-Member -NotePropertyName id -NotePropertyValue $createdId
+                    return (@{ id = $createdId; displayName = $global:policy.displayName } | ConvertTo-Json -Compress)
+                }
+                if ($request -match '--method (PATCH|DELETE)') {
+                    $global:mutations += $request
+                    throw 'Existing intended consent must not be rewritten'
+                }
+                throw "Unexpected mocked az call: $request"
+            }
+
+            & $env:OAUTH_HARDENING_SCRIPT `
+                -ConfirmTenantId $tenantId `
+                -ExcludedUserIds @($excludedId) `
+                -ManifestPath $manifestPath 6>&1 | Out-Null
+            if (($global:mutations -join ',') -ne 'POST') {
+                throw "Existing intended consent caused an extra mutation: $($global:mutations -join ',')"
+            }
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            if ($manifest.state -ne 'applied' -or $manifest.conditionalAccess.id -ne $createdId) {
+                throw 'Apply did not record the exact created policy with the preexisting consent setting'
             }
             "OK"
             """
@@ -815,6 +900,8 @@ class OAuthScriptContractTests(unittest.TestCase):
             $global:currentConsent = @($global:originalConsent)
             $global:policy = $null
             $global:mutations = @()
+            $global:authorizationReads = 0
+            $global:injectConsentDriftAtRead = 0
 
             function global:az {
                 $request = $args -join ' '
@@ -822,6 +909,13 @@ class OAuthScriptContractTests(unittest.TestCase):
                     return (@{ tenantId = $tenantId } | ConvertTo-Json -Compress)
                 }
                 if ($request -match '--method GET' -and $request -match 'policies/authorizationPolicy') {
+                    $global:authorizationReads += 1
+                    if (
+                        $global:injectConsentDriftAtRead -gt 0 -and
+                        $global:authorizationReads -eq $global:injectConsentDriftAtRead
+                    ) {
+                        $global:currentConsent = @('foreign-drift-policy')
+                    }
                     return (@{
                         id = 'authorizationPolicy'
                         defaultUserRolePermissions = @{
@@ -893,6 +987,27 @@ class OAuthScriptContractTests(unittest.TestCase):
             }
 
             $global:policy.state = 'enabledForReportingButNotEnforced'
+            $global:authorizationReads = 0
+            $global:injectConsentDriftAtRead = 2
+            $consentRaceMessage = ''
+            try {
+                & $env:OAUTH_HARDENING_SCRIPT `
+                    -ConfirmTenantId $tenantId `
+                    -ManifestPath $manifestPath `
+                    -Rollback 6>&1 | Out-Null
+            } catch {
+                $consentRaceMessage = $_.Exception.Message
+            }
+            if ($consentRaceMessage -notmatch 'drifted from both') {
+                throw "Rollback did not reject a consent change immediately before PATCH: $consentRaceMessage"
+            }
+            if ($global:mutations.Count -ne 0) {
+                throw 'A consent race during rollback caused a mutation'
+            }
+
+            $global:currentConsent = @('managepermissiongrantsforself.microsoft-user-default-low')
+            $global:authorizationReads = 0
+            $global:injectConsentDriftAtRead = 0
             & $env:OAUTH_HARDENING_SCRIPT `
                 -ConfirmTenantId $tenantId `
                 -ManifestPath $manifestPath `
@@ -906,6 +1021,14 @@ class OAuthScriptContractTests(unittest.TestCase):
             $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
             if ($manifest.state -ne 'rolled-back') {
                 throw "Rollback state was not durable: $($manifest.state)"
+            }
+
+            & $env:OAUTH_HARDENING_SCRIPT `
+                -ConfirmTenantId $tenantId `
+                -ManifestPath $manifestPath `
+                -Rollback 6>&1 | Out-Null
+            if (($global:mutations -join ',') -ne 'PATCH-CONSENT,DELETE-CA') {
+                throw 'A completed rollback rerun attempted another mutation'
             }
             "OK"
             """
