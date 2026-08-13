@@ -55,6 +55,15 @@ class OAuthScriptContractTests(unittest.TestCase):
         self.assertIn('techniques     = @("T1566", "T1204")', script)
         self.assertIn('subTechniques  = @("T1566.002", "T1204.001")', script)
 
+    def test_hunts_never_trust_application_display_names(self):
+        hunts = (ROOT / "detection" / "hunting-queries.kql").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("let ApprovedAppIds = dynamic([]);", hunts)
+        self.assertIn("AppIdUsed !in~ (ApprovedAppIds)", hunts)
+        self.assertNotIn("AppDisplayName !in (", hunts)
+
     def test_every_workbook_query_is_bound_to_the_time_range_parameter(self):
         script = (ROOT / "scripts" / "Deploy-Lab.ps1").read_text(encoding="utf-8")
 

@@ -33,10 +33,13 @@ AuditLogs
 // -----------------------------------------------------------------------------
 let CorporateNetworks = dynamic(["203.0.113.0/24", "198.51.100.0/24"]);   // your IPv4 ranges
 let CorporateNetworksV6 = dynamic([]);                                    // your IPv6 ranges, if any
+// Populate only with immutable AppId values that your tenant has reviewed.
+// An empty list suppresses nothing; application display names are attacker-controlled.
+let ApprovedAppIds = dynamic([]);
 SigninLogs
 | where TimeGenerated > ago(30d)
-| where AppDisplayName !in ("Microsoft Office", "Azure Portal", "Microsoft Teams",
-    "Outlook Mobile", "Windows Sign In", "Microsoft Authentication Broker")
+| extend AppIdUsed = AppId
+| where isempty(AppIdUsed) or AppIdUsed !in~ (ApprovedAppIds)
 | where ResourceDisplayName has "Graph" or ResourceDisplayName has "Office 365"
 // coalesce, not ==false: ipv4_is_in_any_range returns null for an IPv6 address,
 // and `null == false` is null, so a bare comparison discarded every IPv6 row.
