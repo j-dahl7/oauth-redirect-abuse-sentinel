@@ -1,0 +1,38 @@
+[
+  {
+    "name": "normal AppAddress objects alert only on the added address",
+    "oldValue": [
+      { "Address": "https://safe.example/callback", "AddressType": 0 }
+    ],
+    "newValue": [
+      { "Address": "https://safe.example/callback", "AddressType": 0 },
+      { "Address": "https://campaign.ngrok-free.app/callback", "AddressType": 0 }
+    ],
+    "expectedAdded": ["https://campaign.ngrok-free.app/callback"]
+  },
+  {
+    "name": "legacy strings are normalized without dropping records",
+    "oldValue": ["https://safe.example/callback"],
+    "newValue": [
+      "https://safe.example/callback",
+      "http://login.example/callback"
+    ],
+    "expectedAdded": ["http://login.example/callback"]
+  },
+  {
+    "name": "an unchanged object does not alert",
+    "oldValue": [
+      { "Address": "https://safe.example/callback", "AddressType": 0 }
+    ],
+    "newValue": [
+      { "Address": "https://safe.example/callback", "AddressType": 0 }
+    ],
+    "expectedAdded": []
+  },
+  {
+    "name": "malformed objects and nulls are ignored",
+    "oldValue": [],
+    "newValue": [null, {}, { "AddressType": 0 }],
+    "expectedAdded": []
+  }
+]

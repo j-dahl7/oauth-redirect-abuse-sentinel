@@ -23,6 +23,12 @@
 .PARAMETER ExcludedUserIds
     Entra user object IDs, such as emergency-access accounts, to exclude from the report-only Conditional Access policy.
 
+.PARAMETER ConfirmTenantId
+    Exact Entra tenant GUID expected from the active Azure CLI account. Required when ApplyHardening performs writes.
+
+.PARAMETER HardeningManifestPath
+    Owner-only local manifest used to prove CA ownership and restore the exact captured consent policy.
+
 .PARAMETER SkipHardening
     Deprecated compatibility switch. If present, tenant hardening is skipped even when ApplyHardening is present.
 
@@ -64,6 +70,12 @@ param(
     [string[]]$ExcludedUserIds = @(),
 
     [Parameter()]
+    [string]$ConfirmTenantId,
+
+    [Parameter()]
+    [string]$HardeningManifestPath,
+
+    [Parameter()]
     [switch]$SkipHardening,
 
     [Parameter()]
@@ -79,6 +91,9 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LabRoot = Split-Path -Parent $ScriptDir
 $LabOwnerMarker = 'nine-lives-zero-trust:oauth-redirect-abuse-sentinel'
 $LabWorkbookTitle = 'OAuth Security Dashboard'
+if ([string]::IsNullOrWhiteSpace($HardeningManifestPath)) {
+    $HardeningManifestPath = Join-Path $LabRoot '.oauth-hardening-manifest.json'
+}
 
 function Get-LabResourceGuid {
     param(
@@ -173,10 +188,31 @@ AuditLogs
 | where OperationName in ("Add application", "Update application")
 | mv-expand ModifiedProperty = TargetResources[0].modifiedProperties
 | where ModifiedProperty.displayName == "AppAddress"
-| extend NewRedirectUris = tostring(ModifiedProperty.newValue)
-| where NewRedirectUris != "[]"
-| extend RedirectUriValues = parse_json(NewRedirectUris)
-| mv-expand RedirectUri = RedirectUriValues to typeof(string)
+| extend NewAddressItems = parse_json(tostring(ModifiedProperty.newValue)),
+    OldAddressItems = parse_json(tostring(ModifiedProperty.oldValue))
+| extend NewAddressItems = iff(isnull(NewAddressItems), dynamic([]), NewAddressItems),
+    OldAddressItems = iff(isnull(OldAddressItems), dynamic([]), OldAddressItems)
+// AppAddress normally stores objects such as {"Address":"https://..."};
+// legacy/exported records can contain bare strings. Normalize both shapes.
+| extend NewAddressItems = array_concat(NewAddressItems, dynamic([null]))
+| mv-apply NewAddressItem = NewAddressItems on (
+    extend CandidateNewUri = case(
+        gettype(NewAddressItem) == "dictionary", tostring(NewAddressItem.Address),
+        gettype(NewAddressItem) == "string", tostring(NewAddressItem),
+        "")
+    | summarize NewRedirectUris = make_set_if(CandidateNewUri, isnotempty(CandidateNewUri))
+)
+// Append a null sentinel so an empty oldValue still produces an empty set.
+| extend OldAddressItems = array_concat(OldAddressItems, dynamic([null]))
+| mv-apply OldAddressItem = OldAddressItems on (
+    extend CandidateOldUri = case(
+        gettype(OldAddressItem) == "dictionary", tostring(OldAddressItem.Address),
+        gettype(OldAddressItem) == "string", tostring(OldAddressItem),
+        "")
+    | summarize OldRedirectUris = make_set_if(CandidateOldUri, isnotempty(CandidateOldUri))
+)
+| extend AddedRedirectUris = set_difference(NewRedirectUris, OldRedirectUris)
+| mv-expand RedirectUri = AddedRedirectUris to typeof(string)
 | extend ParsedRedirectUri = parse_url(RedirectUri)
 | extend RedirectScheme = tolower(tostring(ParsedRedirectUri.Scheme)),
     RedirectHost = tolower(tostring(ParsedRedirectUri.Host))
@@ -192,6 +228,7 @@ AuditLogs
     AppName,
     AppObjectId,
     NewRedirectUris,
+    OldRedirectUris,
     RedirectUri,
     RedirectHost,
     InitiatedByUser,
@@ -270,26 +307,32 @@ SigninLogs
         description = "Detects when multiple users consent to the same OAuth app within a short window, indicating a phishing campaign."
         severity    = "High"
         query       = @"
-let ConsentThreshold = 3;
+let ConsentUserThreshold = 3;
 let TimeWindow = 1h;
 AuditLogs
 | where TimeGenerated > ago(1d)
 | where OperationName == "Consent to application"
-| extend ConsentUser = tostring(InitiatedBy.user.userPrincipalName)
+| extend ConsentUserId = tolower(tostring(InitiatedBy.user.id)),
+    ConsentUser = tostring(InitiatedBy.user.userPrincipalName)
+| where isnotempty(ConsentUserId)
 | extend AppDisplayName = tostring(TargetResources[0].displayName)
 | extend AppId = tostring(TargetResources[0].id)
 | summarize
-    ConsentCount = count(),
+    ConsentEventCount = count(),
+    DistinctConsentUsers = dcount(ConsentUserId),
+    ConsentUserIds = make_set(ConsentUserId, 20),
     ConsentUsers = make_set(ConsentUser, 20),
     FirstConsent = min(TimeGenerated),
     LastConsent = max(TimeGenerated)
     by AppDisplayName, AppId, bin(TimeGenerated, TimeWindow)
-| where ConsentCount >= ConsentThreshold
+| where DistinctConsentUsers >= ConsentUserThreshold
 | project
     TimeGenerated,
     AppDisplayName,
     AppId,
-    ConsentCount,
+    ConsentEventCount,
+    DistinctConsentUsers,
+    ConsentUserIds,
     ConsentUsers,
     ConsentWindow = LastConsent - FirstConsent
 "@
@@ -580,7 +623,9 @@ if ($PSCmdlet.ShouldProcess($LabWorkbookTitle, "$workbookAction Sentinel workboo
 if ($ApplyHardening -and -not $SkipHardening) {
     Write-Host "`n[3/5] Applying OAuth hardening..." -ForegroundColor Yellow
     & "$LabRoot/hardening/Set-OAuthHardening.ps1" `
+        -ConfirmTenantId $ConfirmTenantId `
         -ExcludedUserIds $ExcludedUserIds `
+        -ManifestPath $HardeningManifestPath `
         -WhatIf:$WhatIfPreference
 } else {
     Write-Host "`n[3/5] Skipping tenant hardening (add -ApplyHardening to apply)" -ForegroundColor DarkGray

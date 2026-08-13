@@ -1,2 +1,4 @@
 __pycache__/
 *.py[cod]
+.oauth-hardening-manifest.json
+.oauth-hardening-manifest.json.*.tmp

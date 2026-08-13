@@ -1,0 +1,36 @@
+[
+  {
+    "name": "repeated events from one immutable user do not satisfy the threshold",
+    "events": [
+      { "userId": "11111111-1111-1111-1111-111111111111", "upn": "old@example.test" },
+      { "userId": "11111111-1111-1111-1111-111111111111", "upn": "renamed@example.test" },
+      { "userId": "11111111-1111-1111-1111-111111111111", "upn": "renamed@example.test" }
+    ],
+    "expectedEventCount": 3,
+    "expectedDistinctUsers": 1,
+    "expectedAlert": false
+  },
+  {
+    "name": "three distinct immutable users satisfy the threshold",
+    "events": [
+      { "userId": "11111111-1111-1111-1111-111111111111", "upn": "one@example.test" },
+      { "userId": "22222222-2222-2222-2222-222222222222", "upn": "two@example.test" },
+      { "userId": "33333333-3333-3333-3333-333333333333", "upn": "three@example.test" },
+      { "userId": "33333333-3333-3333-3333-333333333333", "upn": "three@example.test" }
+    ],
+    "expectedEventCount": 4,
+    "expectedDistinctUsers": 3,
+    "expectedAlert": true
+  },
+  {
+    "name": "empty user IDs are discarded before event and user aggregation",
+    "events": [
+      { "userId": "", "upn": "unknown@example.test" },
+      { "userId": null, "upn": "unknown2@example.test" },
+      { "userId": "11111111-1111-1111-1111-111111111111", "upn": "one@example.test" }
+    ],
+    "expectedEventCount": 1,
+    "expectedDistinctUsers": 1,
+    "expectedAlert": false
+  }
+]

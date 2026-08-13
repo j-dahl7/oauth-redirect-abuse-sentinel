@@ -14,10 +14,12 @@ the captured tenant consent configuration and remove the exact CA policy.
 
 ## Validation Boundary
 
-The August 13, 2026 revision passed twelve offline contract tests, including
-PowerShell parsing and mocked ownership/preview behavior, immutable-App-ID rule
-and hunt checks, standalone-to-deployed query equality, parsed redirect-host
-matching, workbook time-range binding, and documented Graph-permission checks. It
+The August 13, 2026 revision passed eighteen offline contract tests, including
+PowerShell parsing; mocked preview, foreign-policy rejection, apply, idempotent
+rerun, partial-failure compensation, drift-aware rollback, and ownership
+behavior and fail-closed tenant/exclusion checks; immutable-user/App-ID rule checks; standalone-to-deployed query
+equality; AppAddress object/string fixtures; redirect-host matching; workbook
+time-range binding; and documented Graph-permission checks. It
 was not deployed to a tenant, no live Graph hardening call was made, and no live
 Sentinel query or incident was validated for this revision. Rule output depends
 on the target workspace's `SigninLogs`/`AuditLogs` schema, data connectors,
@@ -32,7 +34,7 @@ volume, and ingestion latency.
 | 4 Analytics Rules | Sentinel Scheduled | OAuth consent after risky sign-in, suspicious redirect URI, OAuth error patterns, bulk consent |
 | 1 Workbook | Azure Workbook | OAuth Security Dashboard (consent timeline, error patterns, URI changes, top apps) |
 | Optional consent policy change | Entra ID | Tenant authorization-policy update; applied only with `-ApplyHardening` |
-| Optional CA Policy | Entra ID | Report-only step-up policy; created/updated only with `-ApplyHardening` |
+| Optional CA Policy | Entra ID | Newly created report-only step-up policy; same-named policies are never adopted or updated |
 | 5 Hunting Queries | KQL files | Delegated permissions audit, non-corporate IPs, new high-priv apps, URI inventory, token replay |
 | 1 Audit Script | PowerShell | Enumerate all OAuth apps for suspicious redirect URIs and overprivileged permissions |
 
@@ -55,6 +57,8 @@ volume, and ingestion latency.
   **Policy.Read.All** plus **Policy.ReadWrite.ConditionalAccess** permissions
 - Exact Entra object IDs for emergency-access accounts to pass through
   `-ExcludedUserIds` before applying the report-only CA policy
+- The exact active Entra tenant GUID to pass through `-ConfirmTenantId`; the
+  script rejects a different or missing tenant confirmation before cloud writes
 
 The existing Sentinel workspace is a shared target. The deployment creates or
 updates rules and a workbook there. Entra hardening is **off by default** because
@@ -106,6 +110,7 @@ object IDs, opt in to hardening:
   -ResourceGroup "rg-sentinel-lab" `
   -WorkspaceName "law-sentinel-lab" `
   -ApplyHardening `
+  -ConfirmTenantId "<verified-tenant-guid>" `
   -ExcludedUserIds @("<break-glass-object-id-1>","<break-glass-object-id-2>")
 ```
 
@@ -117,17 +122,19 @@ The script:
 4. Applies OAuth hardening only when `-ApplyHardening` is present
 5. Runs the OAuth app audit and saves a CSV report unless `-SkipAudit` is present
 
-`-WhatIf` performs discovery/read calls but skips guarded cloud writes, tenant
-hardening, temporary request-body files, and the audit/CSV. It does not validate
-KQL results or CA impact. `-SkipHardening` remains only as a deprecated
+`-WhatIf` performs discovery/read calls but skips guarded cloud writes, the
+ownership manifest, temporary request-body files, and the audit/CSV. It reports
+missing tenant confirmation or emergency-access exclusions without applying
+anything. It does not validate KQL results or CA impact. `-SkipHardening` remains only as a deprecated
 compatibility switch; absence of `-ApplyHardening` is the normal safe default.
 Analytics rules and the workbook use deterministic workspace-scoped IDs plus
 explicit ownership markers. Deployment fails closed instead of adopting a
 same-named resource or overwriting a deterministic ID whose marker does not match.
 
 Current deployment parameters are `-ResourceGroup`, `-WorkspaceName`,
-`-ApplyHardening`, `-ExcludedUserIds`, `-SkipHardening` (deprecated),
-`-SkipAudit`, `-Destroy`, and PowerShell's common `-WhatIf` switch.
+`-ApplyHardening`, `-ConfirmTenantId`, `-ExcludedUserIds`,
+`-HardeningManifestPath`, `-SkipHardening` (deprecated), `-SkipAudit`,
+`-Destroy`, and PowerShell's common `-WhatIf` switch.
 
 ### 3. Verify Deployment
 
@@ -152,7 +159,7 @@ Correlates `SigninLogs` risk indicators with `AuditLogs` consent events within a
 
 ### Rule 2: Suspicious OAuth Redirect URI Registered (Medium)
 
-Watches for app registrations adding redirect URIs to tunneling services, free hosting, URL shorteners, or non-HTTPS endpoints. It exempts the exact `localhost` and `127.0.0.1` HTTP loopback hosts that Microsoft supports for local application development; other HTTP hosts remain suspicious.
+Watches for app registrations adding redirect URIs to tunneling services, free hosting, URL shorteners, or non-HTTPS endpoints. It normalizes the normal `AppAddress` object shape and legacy bare-string records, compares `oldValue` with `newValue`, and evaluates additions only. It exempts the exact `localhost` and `127.0.0.1` HTTP loopback hosts that Microsoft supports for local application development; other HTTP hosts remain suspicious.
 
 **MITRE:** T1098 (Account Manipulation)
 
@@ -164,7 +171,9 @@ Groups repeated consent, scope, app-registration, grant, and client-authenticati
 
 ### Rule 4: Bulk OAuth Consent to Single App (High)
 
-Fires when 3+ users consent to the same app within 1 hour.
+Fires when 3+ distinct, nonempty Entra user object IDs consent to the same app
+within 1 hour. Repeated consent events from one user remain visible in the event
+count but do not satisfy the distinct-user threshold.
 
 **MITRE:** T1566.002 (Spearphishing Link)
 
@@ -197,17 +206,27 @@ The `Set-OAuthHardening.ps1` script restricts user consent to:
 - Existing `managePermissionGrantsForOwnedResource.*` entries are preserved when the policy is updated
 
 This updates the tenant's authorization policy, not a lab-scoped resource.
-Record the complete original `permissionGrantPoliciesAssigned` collection
-before applying it. The script cannot infer the desired rollback state later.
+Before its first Graph mutation, the script writes an owner-only manifest with
+the tenant ID, complete original and intended `permissionGrantPoliciesAssigned`
+collections, intended content hashes, and reviewed exclusions. Graph assigns CA
+policy IDs server-side, so the script records the exact returned ID atomically
+before changing the tenant authorization policy. Preserve this manifest: it is
+the ownership proof and rollback source of truth.
 
 ### Conditional Access Policy
 
-Creates a report-only lab CA policy that applies when:
+Creates a new report-only lab CA policy that applies when:
 - Sign-in risk is Medium or High
 - Grant controls require **MFA**
 - Session sign-in frequency is set to **Every time**
 
 Review the policy for 7 days before enforcing it.
+
+The script never finds or adopts a policy by display name. A current or legacy
+same-name policy without the exact ID in the manifest is treated as foreign and
+causes a failure before writes. Reruns accept only the exact manifest-owned ID
+with the exact intended content hash; changing exclusions or policy content
+requires rollback followed by a new manifest.
 
 ### OAuth App Audit
 
@@ -276,22 +295,21 @@ and remove those manually only after verifying their immutable IDs and content.
 
 ### Remove Hardening (if applied)
 
-**Revert consent policy:** Restore the complete
-`permissionGrantPoliciesAssigned` collection captured immediately before the
-lab. Do not replace it with a guessed single value or discard existing
-`managePermissionGrantsForOwnedResource.*` entries.
-
-**Delete CA policy:**
+Preview the drift-aware rollback:
 
 ```powershell
-az rest --method DELETE `
-    --url 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies/<policy-id>'
+./hardening/Set-OAuthHardening.ps1 `
+  -ConfirmTenantId "<verified-tenant-guid>" `
+  -Rollback `
+  -WhatIf
 ```
 
-Use the immutable policy ID returned by deployment and first verify that its
-display name, report-only state, conditions, exclusions, and provenance match
-this lab. Cleanup does not remove `oauth-audit-report.csv`; handle that local
-report according to its potentially sensitive tenant inventory content.
+Then omit `-WhatIf` to restore the exact captured consent collection and delete
+only the exact manifest-owned CA policy. Rollback preflights both surfaces before
+its first mutation and refuses consent or CA drift; it never deletes by name.
+The completed owner-only manifest is retained as a rollback record. Cleanup does
+not remove `oauth-audit-report.csv`; handle that local report according to its
+potentially sensitive tenant inventory content.
 
 ---
 
@@ -323,7 +341,10 @@ Administrator**) and **Policy.Read.All** plus
 **Policy.ReadWrite.ConditionalAccess**. Run with `-WhatIf` to preview changes:
 
 ```powershell
-./hardening/Set-OAuthHardening.ps1 -WhatIf
+./hardening/Set-OAuthHardening.ps1 `
+  -ConfirmTenantId "<verified-tenant-guid>" `
+  -ExcludedUserIds @("<break-glass-object-guid>") `
+  -WhatIf
 ```
 
 ---
