@@ -64,6 +64,22 @@ class OAuthScriptContractTests(unittest.TestCase):
         self.assertIn("AppIdUsed !in~ (ApprovedAppIds)", hunts)
         self.assertNotIn("AppDisplayName !in (", hunts)
 
+    def test_redirect_rule_parses_uri_hosts_and_schemes(self):
+        standalone = (ROOT / "detection" / "analytics-rules.kql").read_text(
+            encoding="utf-8"
+        )
+        deployed = (ROOT / "scripts" / "Deploy-Lab.ps1").read_text(
+            encoding="utf-8"
+        )
+
+        for source in (standalone, deployed):
+            self.assertIn("parse_json(NewRedirectUris)", source)
+            self.assertIn("parse_url(RedirectUri)", source)
+            self.assertIn("RedirectHost matches regex SuspiciousHostRegex", source)
+            self.assertIn('RedirectScheme == "http"', source)
+            self.assertNotIn("NewRedirectUris has_any", source)
+            self.assertNotIn('NewRedirectUris has "http://"', source)
+
     def test_every_workbook_query_is_bound_to_the_time_range_parameter(self):
         script = (ROOT / "scripts" / "Deploy-Lab.ps1").read_text(encoding="utf-8")
 

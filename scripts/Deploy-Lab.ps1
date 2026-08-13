@@ -153,16 +153,21 @@ AuditLogs
         description = "Detects app registrations with redirect URIs pointing to free hosting, URL shorteners, or non-HTTPS endpoints."
         severity    = "Medium"
         query       = @"
-let SuspiciousDomains = dynamic(["ngrok.io","ngrok-free.app","trycloudflare.com","serveo.net","localtunnel.me","workers.dev","pages.dev","herokuapp.com","netlify.app","vercel.app","github.io","gitlab.io","surge.sh","glitch.me","replit.dev","powerappsportals.com","webhook.site","requestbin.com","pipedream.com","bit.ly","tinyurl.com","t.co","rebrand.ly"]);
+let SuspiciousHostRegex = @"^([a-z0-9-]+\.)*(ngrok\.io|ngrok-free\.app|trycloudflare\.com|serveo\.net|localtunnel\.me|workers\.dev|pages\.dev|herokuapp\.com|netlify\.app|vercel\.app|github\.io|gitlab\.io|surge\.sh|glitch\.me|replit\.dev|powerappsportals\.com|webhook\.site|requestbin\.com|pipedream\.com|bit\.ly|tinyurl\.com|t\.co|rebrand\.ly)$";
 AuditLogs
 | where OperationName in ("Add application", "Update application")
 | mv-expand ModifiedProperty = TargetResources[0].modifiedProperties
 | where ModifiedProperty.displayName == "AppAddress"
 | extend NewRedirectUris = tostring(ModifiedProperty.newValue)
+| where NewRedirectUris != "[]"
+| extend RedirectUriValues = parse_json(NewRedirectUris)
+| mv-expand RedirectUri = RedirectUriValues to typeof(string)
+| extend ParsedRedirectUri = parse_url(RedirectUri)
+| extend RedirectScheme = tolower(tostring(ParsedRedirectUri.Scheme)), RedirectHost = tolower(tostring(ParsedRedirectUri.Host))
 | extend InitiatedBy_ = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName))
 | extend AppName = tostring(TargetResources[0].displayName)
-| where NewRedirectUris has_any (SuspiciousDomains) or NewRedirectUris has "http://"
-| project TimeGenerated, AppName, NewRedirectUris, InitiatedBy_
+| where RedirectHost matches regex SuspiciousHostRegex or RedirectScheme == "http"
+| project TimeGenerated, AppName, NewRedirectUris, RedirectUri, RedirectHost, InitiatedBy_
 "@
         tactics        = @("Persistence")
         techniques     = @("T1098")

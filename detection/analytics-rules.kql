@@ -45,18 +45,8 @@ AuditLogs
 //   pointing to non-organizational domains, free hosting, tunneling services,
 //   or URL shorteners commonly used in OAuth redirect abuse campaigns.
 // -----------------------------------------------------------------------------
-let SuspiciousDomains = dynamic([
-    // Tunneling services
-    "ngrok.io", "ngrok-free.app", "trycloudflare.com", "serveo.net", "localtunnel.me",
-    // Free hosting / PaaS
-    "workers.dev", "pages.dev", "herokuapp.com", "netlify.app", "vercel.app",
-    "github.io", "gitlab.io", "surge.sh", "glitch.me", "replit.dev",
-    "powerappsportals.com",
-    // Webhook / request capture
-    "webhook.site", "requestbin.com", "pipedream.com",
-    // URL shorteners
-    "bit.ly", "tinyurl.com", "t.co", "rebrand.ly"
-]);
+// Match exact hosts or their subdomains after parsing each absolute redirect URI.
+let SuspiciousHostRegex = @"^([a-z0-9-]+\.)*(ngrok\.io|ngrok-free\.app|trycloudflare\.com|serveo\.net|localtunnel\.me|workers\.dev|pages\.dev|herokuapp\.com|netlify\.app|vercel\.app|github\.io|gitlab\.io|surge\.sh|glitch\.me|replit\.dev|powerappsportals\.com|webhook\.site|requestbin\.com|pipedream\.com|bit\.ly|tinyurl\.com|t\.co|rebrand\.ly)$";
 AuditLogs
 | where TimeGenerated > ago(1d)
 | where OperationName in ("Add application", "Update application")
@@ -64,18 +54,25 @@ AuditLogs
 | where ModifiedProperty.displayName == "AppAddress"
 | extend NewRedirectUris = tostring(ModifiedProperty.newValue)
 | where NewRedirectUris != "[]"
+| extend RedirectUriValues = parse_json(NewRedirectUris)
+| mv-expand RedirectUri = RedirectUriValues to typeof(string)
+| extend ParsedRedirectUri = parse_url(RedirectUri)
+| extend RedirectScheme = tolower(tostring(ParsedRedirectUri.Scheme)),
+    RedirectHost = tolower(tostring(ParsedRedirectUri.Host))
 | extend InitiatedByUser = tostring(InitiatedBy.user.userPrincipalName)
 | extend InitiatedByApp = tostring(InitiatedBy.app.displayName)
 | extend AppName = tostring(TargetResources[0].displayName)
 | extend AppObjectId = tostring(TargetResources[0].id)
-| where NewRedirectUris has_any (SuspiciousDomains)
-    or NewRedirectUris has "http://" // non-HTTPS redirects
+| where RedirectHost matches regex SuspiciousHostRegex
+    or RedirectScheme == "http" // non-HTTPS redirects
 | project
     TimeGenerated,
     OperationName,
     AppName,
     AppObjectId,
     NewRedirectUris,
+    RedirectUri,
+    RedirectHost,
     InitiatedByUser,
     InitiatedByApp
 
