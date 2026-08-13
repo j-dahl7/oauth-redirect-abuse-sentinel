@@ -150,10 +150,11 @@ AuditLogs
     },
     @{
         displayName = "LAB - Suspicious OAuth Redirect URI Registered"
-        description = "Detects app registrations with redirect URIs pointing to free hosting, URL shorteners, or non-HTTPS endpoints."
+        description = "Detects app registrations with redirect URIs pointing to free hosting, URL shorteners, or non-HTTPS endpoints other than supported loopback development hosts."
         severity    = "Medium"
         query       = @"
 let SuspiciousHostRegex = @"^([a-z0-9-]+\.)*(ngrok\.io|ngrok-free\.app|trycloudflare\.com|serveo\.net|localtunnel\.me|workers\.dev|pages\.dev|herokuapp\.com|netlify\.app|vercel\.app|github\.io|gitlab\.io|surge\.sh|glitch\.me|replit\.dev|powerappsportals\.com|webhook\.site|requestbin\.com|pipedream\.com|bit\.ly|tinyurl\.com|t\.co|rebrand\.ly)$";
+let ApprovedHttpLoopbackHosts = dynamic(["localhost", "127.0.0.1"]);
 AuditLogs
 | where OperationName in ("Add application", "Update application")
 | mv-expand ModifiedProperty = TargetResources[0].modifiedProperties
@@ -166,7 +167,7 @@ AuditLogs
 | extend RedirectScheme = tolower(tostring(ParsedRedirectUri.Scheme)), RedirectHost = tolower(tostring(ParsedRedirectUri.Host))
 | extend InitiatedBy_ = coalesce(tostring(InitiatedBy.user.userPrincipalName), tostring(InitiatedBy.app.displayName))
 | extend AppName = tostring(TargetResources[0].displayName)
-| where RedirectHost matches regex SuspiciousHostRegex or RedirectScheme == "http"
+| where RedirectHost matches regex SuspiciousHostRegex or (RedirectScheme == "http" and RedirectHost !in~ (ApprovedHttpLoopbackHosts))
 | project TimeGenerated, AppName, NewRedirectUris, RedirectUri, RedirectHost, InitiatedBy_
 "@
         tactics        = @("Persistence")
@@ -174,9 +175,11 @@ AuditLogs
         subTechniques  = @()
     },
     @{
-        displayName = "LAB - OAuth Error-Based Redirect Pattern"
-        description = "Detects sign-in attempts to OAuth apps resulting in error codes used in redirect abuse campaigns."
-        severity    = "High"
+        displayName        = "LAB - OAuth Error Cluster by Application"
+        resourceKey        = "rule:LAB - OAuth Error-Based Redirect Pattern"
+        legacyDisplayNames = @("LAB - OAuth Error-Based Redirect Pattern")
+        description = "Groups repeated OAuth errors by application as a triage lead. Error codes alone do not prove a redirect; correlate with URI changes, consent, ownership, and risk telemetry."
+        severity    = "Medium"
         query       = @"
 // Populate this immutable-ID allowlist from AppId values observed in your tenant.
 // An empty allowlist suppresses nothing and is safer than trusting spoofable display names.
@@ -189,9 +192,9 @@ SigninLogs
 | where ErrorCount > 3 or DistinctUsers > 2
 | project TimeGenerated, AppDisplayName, AppId, ErrorCount, DistinctUsers, Users, ErrorCodes, IPs
 "@
-        tactics        = @("InitialAccess", "Execution")
-        techniques     = @("T1566", "T1204")
-        subTechniques  = @("T1566.002", "T1204.001")
+        tactics        = @()
+        techniques     = @()
+        subTechniques  = @()
     },
     @{
         displayName = "LAB - Bulk OAuth Consent to Single App"
@@ -226,10 +229,12 @@ $existingWorkbooks = @(
 
 $ownedRuleMarker = "[Owner: $LabOwnerMarker]"
 $ruleStates = foreach ($rule in $rules) {
-    $ruleId = Get-LabResourceGuid -ResourceKey "rule:$($rule.displayName)"
+    $resourceKey = if ($rule.resourceKey) { [string]$rule.resourceKey } else { "rule:$($rule.displayName)" }
+    $allowedDisplayNames = @($rule.displayName) + @($rule.legacyDisplayNames)
+    $ruleId = Get-LabResourceGuid -ResourceKey $resourceKey
     $sameNameCollisions = @(
         $existingRules | Where-Object {
-            $_.properties.displayName -eq $rule.displayName -and $_.name -ne $ruleId
+            $allowedDisplayNames -contains [string]$_.properties.displayName -and $_.name -ne $ruleId
         }
     )
     if ($sameNameCollisions.Count -gt 0) {
@@ -242,7 +247,7 @@ $ruleStates = foreach ($rule in $rules) {
     if ($existingRule) {
         $existingDisplayName = [string]$existingRule.properties.displayName
         $existingDescription = [string]$existingRule.properties.description
-        if ($existingDisplayName -cne $rule.displayName -or -not $existingDescription.Contains($ownedRuleMarker)) {
+        if ($allowedDisplayNames -cnotcontains $existingDisplayName -or -not $existingDescription.Contains($ownedRuleMarker)) {
             throw "Refusing to overwrite or delete analytics rule '$ruleId': immutable ID, display name, or ownership marker does not match this lab."
         }
     }
