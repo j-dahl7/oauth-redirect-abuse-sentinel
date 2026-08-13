@@ -14,13 +14,15 @@ the captured tenant consent configuration and remove the exact CA policy.
 
 ## Validation Boundary
 
-The August 13, 2026 revision passed nineteen offline contract tests, including
+The August 13, 2026 revision passed twenty offline contract tests, including
 PowerShell parsing; mocked preview, foreign-policy rejection, apply, idempotent
-rerun, partial-failure compensation, drift-aware rollback, and ownership
-behavior and fail-closed tenant/exclusion checks; immutable-user/App-ID rule checks; standalone-to-deployed query
-equality; AppAddress object/string fixtures; redirect-host matching; workbook
-time-range binding; and documented Graph-permission checks. It
-was not deployed to a tenant, no live Graph hardening call was made, and no live
+rerun, partial-failure compensation, idempotent completed rollback, fresh
+pre-delete drift checks, explicit confirmation cancellation, and ownership
+behavior, canonical Graph casing, and fail-closed tenant/exclusion checks;
+immutable-user/App-ID rule checks; standalone-to-deployed query equality;
+AppAddress object/string fixtures; redirect-host matching; workbook time-range
+binding; and documented Graph-permission checks. It was not deployed to a
+tenant, no live Graph hardening call was made, and no live
 Sentinel query or incident was validated for this revision. Rule output depends
 on the target workspace's `SigninLogs`/`AuditLogs` schema, data connectors,
 volume, and ingestion latency.

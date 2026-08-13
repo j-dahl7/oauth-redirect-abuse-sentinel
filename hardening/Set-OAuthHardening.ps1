@@ -87,7 +87,7 @@ function Get-NormalizedStringArray {
 
     return @(
         @($Value) |
-            ForEach-Object { [string]$_ } |
+            ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
             Sort-Object -Unique
     )
@@ -102,6 +102,29 @@ function Test-EquivalentStringArrays {
     $leftJson = @(Get-NormalizedStringArray $Left) | ConvertTo-Json -Compress
     $rightJson = @(Get-NormalizedStringArray $Right) | ConvertTo-Json -Compress
     return $leftJson -ceq $rightJson
+}
+
+function Get-ConsentCollectionState {
+    param(
+        [AllowNull()][object]$Current,
+        [AllowNull()][object]$Original,
+        [AllowNull()][object]$Intended,
+        [Parameter(Mandatory)]
+        [string]$Operation
+    )
+
+    $matchesOriginal = Test-EquivalentStringArrays $Current $Original
+    $matchesIntended = Test-EquivalentStringArrays $Current $Intended
+    if ($matchesOriginal -and $matchesIntended) {
+        return 'both'
+    }
+    if ($matchesOriginal) {
+        return 'original'
+    }
+    if ($matchesIntended) {
+        return 'intended'
+    }
+    throw "Tenant consent policy drifted from both the manifest original and intended collections; refusing $Operation."
 }
 
 function Get-ConditionalAccessFingerprintObject {
@@ -247,8 +270,15 @@ function Assert-OwnerOnlyManifest {
         [System.Runtime.InteropServices.OSPlatform]::Windows
     )) {
         $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $acl = Get-Acl -LiteralPath $Path
+        $ownerSid = $acl.GetOwner(
+            [System.Security.Principal.SecurityIdentifier]
+        ).Value
+        if ($ownerSid -ne $currentSid) {
+            throw "Manifest '$Path' is not owned by the current Windows identity."
+        }
         $foreignAllowRules = @(
-            (Get-Acl -LiteralPath $Path).Access | Where-Object {
+            $acl.Access | Where-Object {
                 $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
                 $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -ne $currentSid
             }
@@ -289,42 +319,65 @@ function Write-OwnerOnlyManifest {
     $Manifest.updatedAtUtc = [DateTime]::UtcNow.ToString('o')
     $json = $Manifest | ConvertTo-Json -Depth 30
 
-    if (-not (Test-Path -LiteralPath $fullPath)) {
+    $targetExists = Test-Path -LiteralPath $fullPath
+    if ($targetExists) {
+        Assert-OwnerOnlyManifest $fullPath
+    }
+
+    # Create an empty staging file first, lock its permissions down, and only
+    # then place manifest content in it. Sensitive rollback state is therefore
+    # never present in a newly created file while inherited/default ACLs apply.
+    $temporaryPath = "$fullPath.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
         $stream = [System.IO.File]::Open(
-            $fullPath,
+            $temporaryPath,
             [System.IO.FileMode]::CreateNew,
             [System.IO.FileAccess]::Write,
             [System.IO.FileShare]::None
         )
         try {
-            $writer = [System.IO.StreamWriter]::new(
-                $stream,
-                [System.Text.UTF8Encoding]::new($false)
-            )
-            try {
-                $writer.Write($json)
-                $writer.Flush()
-            } finally {
-                $writer.Dispose()
-            }
+            $stream.Flush($true)
         } finally {
             $stream.Dispose()
         }
-        Set-OwnerOnlyFilePermissions $fullPath
-    } else {
-        Assert-OwnerOnlyManifest $fullPath
-        $temporaryPath = "$fullPath.$([guid]::NewGuid().ToString('N')).tmp"
+
+        Set-OwnerOnlyFilePermissions $temporaryPath
+        Assert-OwnerOnlyManifest $temporaryPath
+        $contentStream = [System.IO.File]::Open(
+            $temporaryPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
         try {
-            [System.IO.File]::WriteAllText(
-                $temporaryPath,
-                $json,
-                [System.Text.UTF8Encoding]::new($false)
+            $manifestWriter = [System.IO.StreamWriter]::new(
+                $contentStream,
+                [System.Text.UTF8Encoding]::new($false),
+                4096,
+                $true
             )
-            Set-OwnerOnlyFilePermissions $temporaryPath
-            [System.IO.File]::Move($temporaryPath, $fullPath, $true)
+            try {
+                $manifestWriter.Write($json)
+                $manifestWriter.Flush()
+                $contentStream.Flush($true)
+            } finally {
+                $manifestWriter.Dispose()
+            }
         } finally {
-            Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
+            $contentStream.Dispose()
         }
+        Assert-OwnerOnlyManifest $temporaryPath
+
+        if ($targetExists) {
+            # Revalidate immediately before replacement. The final assertion
+            # below also verifies the ACL/mode that survived the atomic move.
+            Assert-OwnerOnlyManifest $fullPath
+            [System.IO.File]::Move($temporaryPath, $fullPath, $true)
+        } else {
+            [System.IO.File]::Move($temporaryPath, $fullPath, $false)
+        }
+    } finally {
+        Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
     }
 
     Assert-OwnerOnlyManifest $fullPath
@@ -369,6 +422,7 @@ function Invoke-GraphJsonRequest {
 
     $bodyFile = New-TemporaryFile
     try {
+        Set-OwnerOnlyFilePermissions $bodyFile.FullName
         [System.IO.File]::WriteAllText(
             $bodyFile.FullName,
             $JsonBody,
@@ -390,6 +444,11 @@ function Get-ExactConditionalAccessPolicy {
         return $null
     }
     return az rest --method GET --url "$ConditionalAccessPoliciesUrl/$PolicyId" `
+        2>$null | ConvertFrom-Json
+}
+
+function Get-AuthorizationPolicy {
+    return az rest --method GET --url $AuthorizationPolicyUrl `
         2>$null | ConvertFrom-Json
 }
 
@@ -564,6 +623,9 @@ function Invoke-HardeningRollback {
     } else {
         $null
     }
+    if (-not [string]::IsNullOrWhiteSpace($ownedPolicyId) -and -not $ownedPolicy) {
+        throw "Graph omitted manifest-owned Conditional Access policy '$ownedPolicyId'; refusing rollback."
+    }
     if ($ownedPolicy) {
         Assert-OwnedPolicyUnchanged `
             -Policy $ownedPolicy `
@@ -574,11 +636,11 @@ function Invoke-HardeningRollback {
     $currentConsent = @($AuthorizationPolicy.defaultUserRolePermissions.permissionGrantPoliciesAssigned)
     $originalConsent = @($Manifest.authorizationPolicy.originalPermissionGrantPoliciesAssigned)
     $intendedConsent = @($Manifest.authorizationPolicy.intendedPermissionGrantPoliciesAssigned)
-    $consentIsOriginal = Test-EquivalentStringArrays $currentConsent $originalConsent
-    $consentIsIntended = Test-EquivalentStringArrays $currentConsent $intendedConsent
-    if (-not $consentIsOriginal -and -not $consentIsIntended) {
-        throw 'Tenant consent policy drifted from both the captured original and lab-intended collections; refusing rollback.'
-    }
+    $consentState = Get-ConsentCollectionState `
+        -Current $currentConsent `
+        -Original $originalConsent `
+        -Intended $intendedConsent `
+        -Operation 'rollback'
 
     if ($WhatIfPreference) {
         Write-Host '  [WHATIF] Would restore the exact captured consent-policy collection.' -ForegroundColor DarkYellow
@@ -588,27 +650,63 @@ function Invoke-HardeningRollback {
         return
     }
 
-    if (-not $consentIsOriginal -and $PSCmdlet.ShouldProcess(
-        'Authorization Policy',
-        'Restore exact captured permissionGrantPoliciesAssigned collection'
-    )) {
+    if ($consentState -eq 'intended') {
+        if (-not $PSCmdlet.ShouldProcess(
+            'Authorization Policy',
+            'Restore exact captured permissionGrantPoliciesAssigned collection'
+        )) {
+            throw 'Consent-policy rollback was declined; the CA policy and manifest were left intact.'
+        }
         $restoreBody = [ordered]@{
             defaultUserRolePermissions = [ordered]@{
                 permissionGrantPoliciesAssigned = @($originalConsent)
             }
         } | ConvertTo-Json -Depth 8
-        $null = Invoke-GraphJsonRequest `
-            -Method PATCH `
-            -Url $AuthorizationPolicyUrl `
-            -JsonBody $restoreBody
-        $Manifest.state = 'rollback-consent-restored'
-        Write-OwnerOnlyManifest -Manifest $Manifest -Path $ResolvedManifestPath
+        $preRestoreAuthorizationPolicy = Get-AuthorizationPolicy
+        $preRestoreConsentState = Get-ConsentCollectionState `
+            -Current @($preRestoreAuthorizationPolicy.defaultUserRolePermissions.permissionGrantPoliciesAssigned) `
+            -Original $originalConsent `
+            -Intended $intendedConsent `
+            -Operation 'rollback'
+        if ($preRestoreConsentState -eq 'intended') {
+            $null = Invoke-GraphJsonRequest `
+                -Method PATCH `
+                -Url $AuthorizationPolicyUrl `
+                -JsonBody $restoreBody
+            $Manifest.state = 'rollback-consent-restored'
+            Write-OwnerOnlyManifest -Manifest $Manifest -Path $ResolvedManifestPath
+        }
     }
 
-    if ($ownedPolicy -and $PSCmdlet.ShouldProcess(
-        "Conditional Access policy $ownedPolicyId",
-        'Delete exact manifest-owned policy'
-    )) {
+    # Verify the consent surface actually reached the exact original collection
+    # before removing the independent CA control.
+    $verifiedAuthorizationPolicy = Get-AuthorizationPolicy
+    $verifiedConsentState = Get-ConsentCollectionState `
+        -Current @($verifiedAuthorizationPolicy.defaultUserRolePermissions.permissionGrantPoliciesAssigned) `
+        -Original $originalConsent `
+        -Intended $intendedConsent `
+        -Operation 'CA-policy deletion'
+    if ($verifiedConsentState -notin @('original', 'both')) {
+        throw 'Consent rollback was not observable as the exact original collection; refusing to delete the CA policy.'
+    }
+
+    if ($ownedPolicy) {
+        # Re-read immediately before deletion so a change after the initial
+        # preflight cannot be deleted under a stale hash decision.
+        $ownedPolicy = Get-ExactConditionalAccessPolicy $ownedPolicyId
+        if (-not $ownedPolicy) {
+            throw "Graph omitted manifest-owned Conditional Access policy '$ownedPolicyId' immediately before deletion; refusing rollback."
+        }
+        Assert-OwnedPolicyUnchanged `
+            -Policy $ownedPolicy `
+            -ExpectedId $ownedPolicyId `
+            -ExpectedHash ([string]$Manifest.conditionalAccess.intendedHash)
+        if (-not $PSCmdlet.ShouldProcess(
+            "Conditional Access policy $ownedPolicyId",
+            'Delete exact manifest-owned policy'
+        )) {
+            throw 'CA-policy deletion was declined; the manifest was retained for an exact retry.'
+        }
         try {
             $null = Invoke-GraphJsonRequest `
                 -Method DELETE `
@@ -650,9 +748,12 @@ if ($manifest -and [string]$manifest.tenantId -cne $actualTenantId) {
 if ($manifest -and $manifest.state -eq 'ca-create-uncertain') {
     throw 'A prior CA create request has an uncertain outcome. Inspect Conditional Access by immutable ID/audit history; neither apply nor rollback can continue until ownership is resolved.'
 }
+if ($Rollback -and $manifest -and $manifest.state -eq 'rolled-back') {
+    Write-Host "  Manifest '$resolvedManifestPath' already records a completed rollback; no cloud changes are needed." -ForegroundColor Green
+    return
+}
 
-$authorizationPolicy = az rest --method GET --url $AuthorizationPolicyUrl `
-    2>$null | ConvertFrom-Json
+$authorizationPolicy = Get-AuthorizationPolicy
 $allPolicies = @(Get-AllConditionalAccessPolicies)
 
 if ($Rollback) {
@@ -733,12 +834,27 @@ $ownedPolicy = if (-not [string]::IsNullOrWhiteSpace($ownedPolicyId)) {
 } else {
     $null
 }
+if (-not [string]::IsNullOrWhiteSpace($ownedPolicyId) -and -not $ownedPolicy) {
+    throw "Graph omitted manifest-owned Conditional Access policy '$ownedPolicyId'; refusing apply."
+}
 if ($ownedPolicy) {
     Assert-OwnedPolicyUnchanged `
         -Policy $ownedPolicy `
         -ExpectedId $ownedPolicyId `
         -ExpectedHash ([string]$manifest.conditionalAccess.intendedHash)
 }
+
+$manifestOriginalConsent = @(
+    $manifest.authorizationPolicy.originalPermissionGrantPoliciesAssigned
+)
+$manifestIntendedConsent = @(
+    $manifest.authorizationPolicy.intendedPermissionGrantPoliciesAssigned
+)
+$consentState = Get-ConsentCollectionState `
+    -Current $currentConsent `
+    -Original $manifestOriginalConsent `
+    -Intended $manifestIntendedConsent `
+    -Operation 'apply'
 
 if ($WhatIfPreference) {
     Write-Host "  [WHATIF] Would persist owner-only manifest: $resolvedManifestPath" -ForegroundColor DarkYellow
@@ -757,77 +873,97 @@ if (-not $tenantConfirmed) {
 Write-OwnerOnlyManifest -Manifest $manifest -Path $resolvedManifestPath
 
 if (-not $ownedPolicy) {
-    if ($PSCmdlet.ShouldProcess('Conditional Access', "Create new policy: $CaDisplayName")) {
-        $createdPolicyId = $null
-        try {
-            $created = Invoke-GraphJsonRequest `
-                -Method POST `
-                -Url $ConditionalAccessPoliciesUrl `
-                -JsonBody $caPolicyJson | ConvertFrom-Json
-            $createdPolicyId = [string]$created.id
-            if ([string]::IsNullOrWhiteSpace($createdPolicyId)) {
-                throw 'Graph did not return the immutable ID of the created Conditional Access policy.'
-            }
-            $manifest.conditionalAccess.id = $createdPolicyId
-            $manifest.state = 'ca-created'
-            $manifest.lastError = $null
-            Write-OwnerOnlyManifest -Manifest $manifest -Path $resolvedManifestPath
-            $ownedPolicyId = $createdPolicyId
-            $ownedPolicy = $caPolicyObject
-            $ownedPolicy | Add-Member -NotePropertyName id -NotePropertyValue $createdPolicyId
-        } catch {
-            $manifest.state = if ($createdPolicyId) { 'ca-created-manifest-failed' } else { 'ca-create-uncertain' }
-            $manifest.lastError = $_.Exception.Message
-            if ($createdPolicyId) {
-                try {
-                    $null = Invoke-GraphJsonRequest `
-                        -Method DELETE `
-                        -Url "$ConditionalAccessPoliciesUrl/$createdPolicyId"
-                    $manifest.removedPolicyIds = @($manifest.removedPolicyIds) + $createdPolicyId
-                    $manifest.conditionalAccess.id = $null
-                    $manifest.state = 'prepared'
-                } catch {
-                    # Preserve the known exact ID. A rerun can only act on that ID.
-                    $manifest.conditionalAccess.id = $createdPolicyId
-                }
-            }
-            try {
-                Write-OwnerOnlyManifest -Manifest $manifest -Path $resolvedManifestPath
-            } catch {
-                # The original exception remains the actionable failure.
-            }
-            throw
-        }
-        Write-Host "  Created exact owned CA policy ID: $ownedPolicyId" -ForegroundColor Green
+    if (-not $PSCmdlet.ShouldProcess('Conditional Access', "Create new policy: $CaDisplayName")) {
+        throw 'CA-policy creation was declined; no tenant policy was changed.'
     }
+    $createdPolicyId = $null
+    try {
+        $created = Invoke-GraphJsonRequest `
+            -Method POST `
+            -Url $ConditionalAccessPoliciesUrl `
+            -JsonBody $caPolicyJson | ConvertFrom-Json
+        $createdPolicyId = [string]$created.id
+        if ([string]::IsNullOrWhiteSpace($createdPolicyId)) {
+            throw 'Graph did not return the immutable ID of the created Conditional Access policy.'
+        }
+        $manifest.conditionalAccess.id = $createdPolicyId
+        $manifest.state = 'ca-created'
+        $manifest.lastError = $null
+        Write-OwnerOnlyManifest -Manifest $manifest -Path $resolvedManifestPath
+        $ownedPolicyId = $createdPolicyId
+        $ownedPolicy = Get-ExactConditionalAccessPolicy $ownedPolicyId
+        Assert-OwnedPolicyUnchanged `
+            -Policy $ownedPolicy `
+            -ExpectedId $ownedPolicyId `
+            -ExpectedHash ([string]$manifest.conditionalAccess.intendedHash)
+    } catch {
+        $manifest.state = if ($createdPolicyId) { 'ca-created-manifest-failed' } else { 'ca-create-uncertain' }
+        $manifest.lastError = $_.Exception.Message
+        if ($createdPolicyId) {
+            try {
+                $null = Invoke-GraphJsonRequest `
+                    -Method DELETE `
+                    -Url "$ConditionalAccessPoliciesUrl/$createdPolicyId"
+                $manifest.removedPolicyIds = @($manifest.removedPolicyIds) + $createdPolicyId
+                $manifest.conditionalAccess.id = $null
+                $manifest.state = 'prepared'
+            } catch {
+                # Preserve the known exact ID. A rerun can only act on that ID.
+                $manifest.conditionalAccess.id = $createdPolicyId
+            }
+        }
+        try {
+            Write-OwnerOnlyManifest -Manifest $manifest -Path $resolvedManifestPath
+        } catch {
+            # The original exception remains the actionable failure.
+        }
+        throw
+    }
+    Write-Host "  Created exact owned CA policy ID: $ownedPolicyId" -ForegroundColor Green
 }
 
-$manifestOriginalConsent = @(
-    $manifest.authorizationPolicy.originalPermissionGrantPoliciesAssigned
-)
-$manifestIntendedConsent = @(
-    $manifest.authorizationPolicy.intendedPermissionGrantPoliciesAssigned
-)
-$consentIsOriginal = Test-EquivalentStringArrays $currentConsent $manifestOriginalConsent
-$consentIsIntended = Test-EquivalentStringArrays $currentConsent $manifestIntendedConsent
-if (-not $consentIsOriginal -and -not $consentIsIntended) {
-    throw 'Tenant consent policy drifted from both the manifest original and intended collections; refusing to overwrite it.'
-}
+$latestAuthorizationPolicy = Get-AuthorizationPolicy
+$consentState = Get-ConsentCollectionState `
+    -Current @($latestAuthorizationPolicy.defaultUserRolePermissions.permissionGrantPoliciesAssigned) `
+    -Original $manifestOriginalConsent `
+    -Intended $manifestIntendedConsent `
+    -Operation 'apply'
 
-if ($consentIsOriginal -and $PSCmdlet.ShouldProcess(
-    'Authorization Policy',
-    'Restrict user consent using the manifest-intended collection'
-)) {
+if ($consentState -eq 'original') {
+    if (-not $PSCmdlet.ShouldProcess(
+        'Authorization Policy',
+        'Restrict user consent using the manifest-intended collection'
+    )) {
+        throw 'Consent-policy update was declined; the report-only CA policy and manifest were retained for rollback.'
+    }
     $consentBody = [ordered]@{
         defaultUserRolePermissions = [ordered]@{
             permissionGrantPoliciesAssigned = @($manifestIntendedConsent)
         }
     } | ConvertTo-Json -Depth 8
     try {
-        $null = Invoke-GraphJsonRequest `
-            -Method PATCH `
-            -Url $AuthorizationPolicyUrl `
-            -JsonBody $consentBody
+        $preWriteAuthorizationPolicy = Get-AuthorizationPolicy
+        $preWriteConsentState = Get-ConsentCollectionState `
+            -Current @($preWriteAuthorizationPolicy.defaultUserRolePermissions.permissionGrantPoliciesAssigned) `
+            -Original $manifestOriginalConsent `
+            -Intended $manifestIntendedConsent `
+            -Operation 'apply'
+        if ($preWriteConsentState -eq 'original') {
+            $null = Invoke-GraphJsonRequest `
+                -Method PATCH `
+                -Url $AuthorizationPolicyUrl `
+                -JsonBody $consentBody
+        }
+
+        $postWriteAuthorizationPolicy = Get-AuthorizationPolicy
+        $postWriteConsentState = Get-ConsentCollectionState `
+            -Current @($postWriteAuthorizationPolicy.defaultUserRolePermissions.permissionGrantPoliciesAssigned) `
+            -Original $manifestOriginalConsent `
+            -Intended $manifestIntendedConsent `
+            -Operation 'apply verification'
+        if ($postWriteConsentState -notin @('intended', 'both')) {
+            throw 'Consent update was not observable as the exact intended collection.'
+        }
     } catch {
         $applyError = $_
         $manifest.state = 'consent-update-failed'
@@ -854,6 +990,21 @@ if ($consentIsOriginal -and $PSCmdlet.ShouldProcess(
         throw $applyError
     }
 }
+
+$finalAuthorizationPolicy = Get-AuthorizationPolicy
+$finalConsentState = Get-ConsentCollectionState `
+    -Current @($finalAuthorizationPolicy.defaultUserRolePermissions.permissionGrantPoliciesAssigned) `
+    -Original $manifestOriginalConsent `
+    -Intended $manifestIntendedConsent `
+    -Operation 'apply verification'
+if ($finalConsentState -notin @('intended', 'both')) {
+    throw 'Consent restriction is not the exact manifest-intended collection; refusing to report success.'
+}
+$ownedPolicy = Get-ExactConditionalAccessPolicy $ownedPolicyId
+Assert-OwnedPolicyUnchanged `
+    -Policy $ownedPolicy `
+    -ExpectedId $ownedPolicyId `
+    -ExpectedHash ([string]$manifest.conditionalAccess.intendedHash)
 
 $manifest.state = 'applied'
 $manifest.appliedAtUtc = [DateTime]::UtcNow.ToString('o')
