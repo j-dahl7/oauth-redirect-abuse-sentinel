@@ -26,7 +26,7 @@ class OAuthScriptContractTests(unittest.TestCase):
         self.assertIn("includeExternalTenantIds", script)
         self.assertIn("-ConfirmTenantId", script)
         self.assertIn("Apply requires at least one reviewed emergency-access", script)
-        self.assertIn("A prior CA create request has an uncertain outcome", script)
+        self.assertIn("neither apply nor rollback can continue", script)
         self.assertIn("Write-OwnerOnlyManifest -Manifest $manifest", script)
         self.assertIn("function Invoke-GraphJsonRequest", script)
         self.assertIn("finally {", script)
@@ -691,6 +691,97 @@ class OAuthScriptContractTests(unittest.TestCase):
             }
             if ($manifest.removedPolicyIds -notcontains $createdId) {
                 throw 'Manifest did not retain the compensated CA policy ID'
+            }
+            "OK"
+            """
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = os.environ.copy()
+            env["OAUTH_TEST_DIR"] = temp_dir
+            env["OAUTH_HARDENING_SCRIPT"] = str(
+                ROOT / "hardening" / "Set-OAuthHardening.ps1"
+            )
+            result = subprocess.run(
+                ["pwsh", "-NoLogo", "-NoProfile", "-Command", harness],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn("OK", result.stdout)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 is not available")
+    def test_uncertain_ca_create_blocks_apply_and_rollback_reruns(self):
+        harness = textwrap.dedent(
+            r"""
+            $ErrorActionPreference = 'Stop'
+            $tenantId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+            $excludedId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+            $manifestPath = Join-Path $env:OAUTH_TEST_DIR 'manifest.json'
+            $global:postAttempts = 0
+            $global:otherMutations = @()
+            function global:az {
+                $request = $args -join ' '
+                if ($request -match '^account show') {
+                    return (@{ tenantId = $tenantId } | ConvertTo-Json -Compress)
+                }
+                if ($request -match '--method GET' -and $request -match 'policies/authorizationPolicy') {
+                    return '{"id":"authorizationPolicy","defaultUserRolePermissions":{"permissionGrantPoliciesAssigned":[]}}'
+                }
+                if ($request -match '--method GET' -and $request -match 'identity/conditionalAccess/policies') {
+                    return '{"value":[]}'
+                }
+                if ($request -match '--method POST') {
+                    $global:postAttempts += 1
+                    throw 'simulated ambiguous CA create response'
+                }
+                if ($request -match '--method (PATCH|DELETE)') {
+                    $global:otherMutations += $request
+                    throw 'Unexpected mutation'
+                }
+                throw "Unexpected mocked az call: $request"
+            }
+
+            $initialMessage = ''
+            try {
+                & $env:OAUTH_HARDENING_SCRIPT `
+                    -ConfirmTenantId $tenantId `
+                    -ExcludedUserIds @($excludedId) `
+                    -ManifestPath $manifestPath 6>&1 | Out-Null
+            } catch {
+                $initialMessage = $_.Exception.Message
+            }
+            if ($initialMessage -notmatch 'simulated ambiguous CA create response') {
+                throw "Ambiguous create failure was not surfaced: $initialMessage"
+            }
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            if ($manifest.state -ne 'ca-create-uncertain') {
+                throw "Ambiguous create state was not persisted: $($manifest.state)"
+            }
+
+            foreach ($mode in @('apply', 'rollback')) {
+                $message = ''
+                try {
+                    if ($mode -eq 'rollback') {
+                        & $env:OAUTH_HARDENING_SCRIPT `
+                            -ConfirmTenantId $tenantId `
+                            -ManifestPath $manifestPath -Rollback 6>&1 | Out-Null
+                    } else {
+                        & $env:OAUTH_HARDENING_SCRIPT `
+                            -ConfirmTenantId $tenantId `
+                            -ExcludedUserIds @($excludedId) `
+                            -ManifestPath $manifestPath 6>&1 | Out-Null
+                    }
+                } catch {
+                    $message = $_.Exception.Message
+                }
+                if ($message -notmatch 'neither apply nor rollback can continue') {
+                    throw "$mode rerun did not fail closed: $message"
+                }
+            }
+            if ($global:postAttempts -ne 1 -or $global:otherMutations.Count -ne 0) {
+                throw 'An uncertain manifest allowed another cloud mutation'
             }
             "OK"
             """
