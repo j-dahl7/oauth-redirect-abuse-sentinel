@@ -1,4 +1,4 @@
-#Requires -Version 7.3
+#Requires -Version 7.4
 <#
 .SYNOPSIS
     Applies or rolls back explicitly owned OAuth hardening changes in Microsoft Entra ID.
@@ -444,6 +444,8 @@ function Get-ExactConditionalAccessPolicy {
     if ([string]::IsNullOrWhiteSpace($PolicyId)) {
         return $null
     }
+    # A failed read, including HTTP 404, is not proof this operation deleted
+    # the owned policy. Retain the manifest for investigation of external drift.
     return Invoke-AzChecked rest --method GET --url "$ConditionalAccessPoliciesUrl/$PolicyId" `
         2>$null | ConvertFrom-Json
 }

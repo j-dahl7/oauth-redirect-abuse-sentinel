@@ -31,7 +31,14 @@ Run the current offline suite with `python -m unittest discover -s tests -v`.
 It includes paginated Sentinel ownership/collision checks and native-command
 failure tests; no Azure or Graph request is forwarded by the test harnesses.
 The deployer and hardening script check Azure CLI exit codes explicitly, so a
-failed read or delete is fatal even without PowerShell's native-error feature.
+failed read or delete is fatal even when automatic native-error handling is disabled.
+
+A manifest already recorded as `rolled-back` supports a no-write rerun. For a
+pending or applied manifest, an exact policy read returning HTTP 404 does not
+prove that this rollback removed it: the script stops and retains the manifest,
+just as it does for authorization or service failures. Investigate the exact
+tenant and object ID before reconciling external changes; missing data and
+failed authorization are never treated as successful cleanup.
 
 ---
 
@@ -52,7 +59,7 @@ failed read or delete is fatal even without PowerShell's native-error feature.
 
 - Azure subscription with an existing **Microsoft Sentinel** workspace
 - Azure CLI configured (`az login`)
-- PowerShell 7.3+ (`pwsh`)
+- PowerShell 7.4+ (`pwsh`)
 - **Microsoft Sentinel Contributor** or equivalent rule/workbook write
   permissions on the workspace
 - **Directory.Read.All** Microsoft Graph delegated permission and a supported

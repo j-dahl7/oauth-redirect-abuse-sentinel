@@ -78,6 +78,39 @@ class NativeExitTests(unittest.TestCase):
             'OK'
         ''')
 
+    def test_failed_exact_reads_never_become_completed_or_absent_rollback(self):
+        self.run_harness(r'''
+            [CmdletBinding(SupportsShouldProcess)] param()
+            $ErrorActionPreference='Stop'
+            $PSNativeCommandUseErrorActionPreference=$false
+            . (Join-Path $env:LAB_ROOT 'scripts/Invoke-AzChecked.ps1')
+            $tokens=$null;$errors=$null
+            $ast=[System.Management.Automation.Language.Parser]::ParseFile((Join-Path $env:LAB_ROOT 'hardening/Set-OAuthHardening.ps1'),[ref]$tokens,[ref]$errors)
+            foreach($name in @('Get-ExactConditionalAccessPolicy','Invoke-HardeningRollback')) {
+                $definition=$ast.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)
+                Invoke-Expression $definition.Extent.Text
+            }
+            function Assert-NoForeignNameCollision {}
+            function Write-OwnerOnlyManifest { throw 'Failed read attempted to update the manifest' }
+            function global:az {
+                if (($args -join ' ') -notmatch '--method GET') { throw 'Failed read attempted a mutation' }
+                & $env:NATIVE_PYTHON -c 'import sys; print("HTTP " + sys.argv[1], file=sys.stderr); sys.exit(1)' $env:MOCK_STATUS
+            }
+            $ConditionalAccessPoliciesUrl='https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies'
+            foreach($status in @('404','401','403','500')) {
+                $env:MOCK_STATUS=$status
+                $manifest=[pscustomobject]@{conditionalAccess=@{id='cccccccc-cccc-cccc-cccc-cccccccccccc'};state='applied'}
+                $path=Join-Path $env:NATIVE_TEST_DIR 'pending-manifest.json'
+                $original=$manifest | ConvertTo-Json -Depth 5
+                [IO.File]::WriteAllText($path,$original)
+                $failure=''
+                try { Invoke-HardeningRollback -Manifest $manifest -AuthorizationPolicy @{} -AllPolicies @(@{}) -ResolvedManifestPath $path } catch { $failure=$_.Exception.Message }
+                if ($failure -notmatch 'exit code 1') { throw "HTTP $status was not a fatal read failure: $failure" }
+                if ($manifest.state -ne 'applied' -or [IO.File]::ReadAllText($path) -ne $original) { throw 'Failed read changed rollback state' }
+            }
+            'OK'
+        ''')
+
     def test_rollback_keeps_failed_native_delete_retryable(self):
         if not (ROOT / 'hardening/Set-OAuthHardening.ps1').exists():
             self.skipTest('Conditional Access rollback applies to the OAuth repository')
