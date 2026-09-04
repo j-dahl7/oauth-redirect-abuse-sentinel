@@ -1,0 +1,32 @@
+name: Validate OAuth lab safety
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Parse PowerShell entry points
+        shell: pwsh
+        run: |
+          Get-ChildItem scripts,hardening -Filter '*.ps1' | ForEach-Object {
+            $tokens=$null; $errors=$null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors)
+            if ($errors.Count) { throw ($errors | ForEach-Object Message | Out-String) }
+          }
+      - name: Run mocked and offline safety tests
+        run: python -m unittest discover -s tests -v

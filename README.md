@@ -27,6 +27,12 @@ Sentinel query or incident was validated for this revision. Rule output depends
 on the target workspace's `SigninLogs`/`AuditLogs` schema, data connectors,
 volume, and ingestion latency.
 
+Run the current offline suite with `python -m unittest discover -s tests -v`.
+It includes paginated Sentinel ownership/collision checks and native-command
+failure tests; no Azure or Graph request is forwarded by the test harnesses.
+The deployer and hardening script check Azure CLI exit codes explicitly, so a
+failed read or delete is fatal even without PowerShell's native-error feature.
+
 ---
 
 ## What Gets Deployed
@@ -187,11 +193,11 @@ Import the queries from `detection/hunting-queries.kql` into Sentinel Hunting:
 
 | Hunt | Purpose | Lookback |
 |---|---|---|
-| 1. Enumerate Delegated Permissions | Baseline audit of all user-granted permissions | 90 days |
+| 1. Enumerate Delegated Permissions | Observed user-consent events in retained logs | 90 days |
 | 2. Non-Corporate IP Sign-ins | OAuth app auth from unexpected locations | 30 days |
 | 3. New High-Privilege Apps | Recently registered apps with sensitive scopes | 14 days |
-| 4. Redirect URI Inventory | Full audit trail of redirect URI changes | 90 days |
-| 5. Token Replay After Error | Error redirect followed by successful auth from different IP | 7 days |
+| 4. Redirect URI Inventory | Observed redirect URI change history in retained logs | 90 days |
+| 5. Authorization Error Followed by New-IP Authentication | Authorization-error/new-IP-success triage lead; does not prove a redirect or relay | 7 days |
 
 **Hunt 2** requires customization — replace the `CorporateNetworks` variable with your organization's IP ranges.
 
@@ -260,8 +266,15 @@ oauth-redirect-abuse-sentinel/
 ├── hardening/
 │   ├── Set-OAuthHardening.ps1           # Consent restriction + CA policy
 │   └── Audit-OAuthApps.ps1             # OAuth app security audit
-└── scripts/
-    └── Deploy-Lab.ps1                   # Main deployment orchestrator
+├── scripts/
+│   ├── Deploy-Lab.ps1                   # Main deployment orchestrator
+│   └── Invoke-AzChecked.ps1             # Explicit native exit-code handling
+├── tests/
+│   ├── test_script_contract.py          # Existing offline contracts and fixtures
+│   ├── test_rule_pagination.py          # Complete, guarded Sentinel inventory
+│   ├── test_native_exit.py              # Native failure and cleanup behavior
+│   └── fixtures/                       # AppAddress and bulk-consent events
+└── .gitignore                          # Keeps local hardening manifests private
 ```
 
 ---

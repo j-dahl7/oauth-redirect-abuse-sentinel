@@ -308,6 +308,10 @@ class OAuthScriptContractTests(unittest.TestCase):
                     '{"value":[{"name":"default"}]}'
                     return
                 }
+                if ($request -match '^cloud show') {
+                    'https://management.azure.com/'
+                    return
+                }
                 if ($request -match '--method GET' -and $request -match 'alertRules') {
                     $global:rulesJson
                     return

@@ -63,6 +63,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
+. (Join-Path $PSScriptRoot '../scripts/Invoke-AzChecked.ps1')
 $ManifestOwner = 'nine-lives-zero-trust:oauth-redirect-abuse-sentinel'
 $ManifestSchemaVersion = 1
 $CaDisplayName = 'LAB - Require MFA for Risky OAuth Sign-ins'
@@ -417,7 +418,7 @@ function Invoke-GraphJsonRequest {
     )
 
     if ($Method -eq 'DELETE') {
-        return az rest --method DELETE --url $Url
+        return Invoke-AzChecked rest --method DELETE --url $Url
     }
 
     $bodyFile = New-TemporaryFile
@@ -428,7 +429,7 @@ function Invoke-GraphJsonRequest {
             $JsonBody,
             [System.Text.UTF8Encoding]::new($false)
         )
-        return az rest --method $Method `
+        return Invoke-AzChecked rest --method $Method `
             --url $Url `
             --body "@$($bodyFile.FullName)" `
             --headers 'Content-Type=application/json'
@@ -443,12 +444,12 @@ function Get-ExactConditionalAccessPolicy {
     if ([string]::IsNullOrWhiteSpace($PolicyId)) {
         return $null
     }
-    return az rest --method GET --url "$ConditionalAccessPoliciesUrl/$PolicyId" `
+    return Invoke-AzChecked rest --method GET --url "$ConditionalAccessPoliciesUrl/$PolicyId" `
         2>$null | ConvertFrom-Json
 }
 
 function Get-AuthorizationPolicy {
-    return az rest --method GET --url $AuthorizationPolicyUrl `
+    return Invoke-AzChecked rest --method GET --url $AuthorizationPolicyUrl `
         2>$null | ConvertFrom-Json
 }
 
@@ -464,7 +465,7 @@ function Get-AllConditionalAccessPolicies {
             throw 'Conditional Access policy pagination returned a repeated nextLink.'
         }
 
-        $page = az rest --method GET --url $nextUrl 2>$null | ConvertFrom-Json
+        $page = Invoke-AzChecked rest --method GET --url $nextUrl 2>$null | ConvertFrom-Json
         foreach ($policy in @($page.value)) {
             $policies.Add($policy)
         }
@@ -729,7 +730,7 @@ function Invoke-HardeningRollback {
 Write-Host "`n=== OAuth Hardening Configuration ===" -ForegroundColor Cyan
 Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 
-$account = az account show 2>$null | ConvertFrom-Json
+$account = Invoke-AzChecked account show 2>$null | ConvertFrom-Json
 $actualTenantId = [string]$account.tenantId
 if ([string]::IsNullOrWhiteSpace($actualTenantId)) {
     throw 'Azure CLI did not return an active Entra tenant. Run az login and select the intended subscription.'
