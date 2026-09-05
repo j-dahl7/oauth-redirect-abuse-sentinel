@@ -110,9 +110,10 @@ AuditLogs
 | sort by TimeGenerated desc
 
 // -----------------------------------------------------------------------------
-// HUNT 5: Token Replay After OAuth Redirect Error
-// Purpose: Detect pattern where a high-confidence OAuth authorization error
-//   is followed by a successful sign-in from a different IP (possible token relay)
+// HUNT 5: Authorization Error Followed by New-IP Authentication
+// Purpose: Find an OAuth authorization error followed by successful sign-in
+//   from a different IP. Triage lead only: these codes do not prove a redirect
+//   or token relay, and can reflect ordinary consent or application configuration.
 // -----------------------------------------------------------------------------
 let OAuthErrors = SigninLogs
     | where TimeGenerated > ago(7d)

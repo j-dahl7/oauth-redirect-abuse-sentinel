@@ -1,4 +1,4 @@
-#Requires -Version 7.3
+#Requires -Version 7.4
 <#
 .SYNOPSIS
     Deploys the OAuth Redirect Abuse Detection Lab.
@@ -89,6 +89,7 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $LabRoot = Split-Path -Parent $ScriptDir
+. (Join-Path $ScriptDir 'Invoke-AzChecked.ps1')
 $LabOwnerMarker = 'nine-lives-zero-trust:oauth-redirect-abuse-sentinel'
 $LabWorkbookTitle = 'OAuth Security Dashboard'
 if ([string]::IsNullOrWhiteSpace($HardeningManifestPath)) {
@@ -108,6 +109,61 @@ function Get-LabResourceGuid {
     return [guid]::new([byte[]]$hash[0..15]).ToString()
 }
 
+function Get-AllLabAlertRules {
+    param([Parameter(Mandatory)][string]$WorkspaceId)
+
+    # Read the entire collection before treating an ID or name as absent.
+    # Continuations may change the query, never the ARM origin or workspace.
+    $origin = $null
+    $originUrl = Invoke-AzChecked cloud show --query endpoints.resourceManager --output tsv
+    if (-not [uri]::TryCreate($originUrl, [System.UriKind]::Absolute, [ref]$origin) -or
+        $origin.Scheme -ne 'https' -or $origin.Port -ne 443 -or
+        $origin.UserInfo -or $origin.Query -or $origin.Fragment -or $origin.AbsolutePath -ne '/') {
+        throw 'Alert-rule pagination requires a valid HTTPS resource-manager origin from the active Azure cloud.'
+    }
+    $initial = [uri]::new($origin, "$WorkspaceId/providers/Microsoft.SecurityInsights/alertRules?api-version=2024-03-01")
+    $nextUrl = $initial.AbsoluteUri
+    $visited = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $resourceIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $rules = [System.Collections.Generic.List[object]]::new()
+    $pageCount = 0
+
+    while ($nextUrl) {
+        $pageCount++
+        if ($pageCount -gt 100) {
+            throw 'Alert-rule pagination exceeded 100 pages; refusing an incomplete inventory.'
+        }
+        $pageUri = $null
+        if (-not [uri]::TryCreate($initial, $nextUrl, [ref]$pageUri) -or
+            $pageUri.Scheme -ne 'https' -or $pageUri.Host -ne $origin.Host -or
+            $pageUri.Port -ne 443 -or $pageUri.UserInfo -or $pageUri.Fragment -or
+            $pageUri.AbsolutePath -ine $initial.AbsolutePath) {
+            throw 'Alert-rule pagination left the trusted ARM collection; refusing the continuation.'
+        }
+        if (-not $visited.Add($pageUri.AbsoluteUri)) {
+            throw 'Alert-rule pagination repeated a page; refusing an incomplete inventory.'
+        }
+
+        $page = Invoke-AzChecked rest --method GET --url $pageUri.AbsoluteUri 2>$null | ConvertFrom-Json
+        if (-not $page -or $page.value -isnot [array]) {
+            throw 'Alert-rule pagination returned an invalid value array; refusing an incomplete inventory.'
+        }
+        foreach ($rule in $page.value) {
+            if (-not $rule -or $rule.name -isnot [string] -or
+                [string]::IsNullOrWhiteSpace($rule.name) -or -not $resourceIds.Add($rule.name)) {
+                throw 'Alert-rule pagination returned a missing or duplicate resource ID; refusing an ambiguous inventory.'
+            }
+            $rules.Add($rule)
+        }
+        if ($null -ne $page.nextLink -and $page.nextLink -isnot [string]) {
+            throw 'Alert-rule pagination returned an invalid nextLink; refusing the continuation.'
+        }
+        $nextUrl = $page.nextLink
+    }
+
+    return $rules.ToArray()
+}
+
 Write-Host "`n=== OAuth Redirect Abuse Detection Lab ===" -ForegroundColor Cyan
 Write-Host "Resource Group: $ResourceGroup"
 Write-Host "Workspace:      $WorkspaceName"
@@ -115,7 +171,7 @@ Write-Host ""
 
 # Verify prerequisites
 Write-Host "[0/5] Verifying prerequisites..." -ForegroundColor Yellow
-$workspace = az monitor log-analytics workspace show `
+$workspace = Invoke-AzChecked monitor log-analytics workspace show `
     --resource-group $ResourceGroup `
     --workspace-name $WorkspaceName 2>$null | ConvertFrom-Json
 
@@ -128,7 +184,7 @@ $customerId = $workspace.customerId
 Write-Host "  Workspace ID: $customerId" -ForegroundColor DarkGray
 
 # Check Sentinel is enabled
-$sentinel = az rest --method GET `
+$sentinel = Invoke-AzChecked rest --method GET `
     --url "$workspaceId/providers/Microsoft.SecurityInsights/onboardingStates?api-version=2024-03-01" `
     2>$null | ConvertFrom-Json
 
@@ -342,12 +398,9 @@ AuditLogs
     }
 )
 
-$existingRulesResponse = az rest --method GET `
-    --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules?api-version=2024-03-01" `
-    2>$null | ConvertFrom-Json
-$existingRules = @($existingRulesResponse.value)
+$existingRules = @(Get-AllLabAlertRules -WorkspaceId $workspaceId)
 $existingWorkbooks = @(
-    az resource list `
+    Invoke-AzChecked resource list `
         --resource-group $ResourceGroup `
         --resource-type Microsoft.Insights/workbooks `
         2>$null | ConvertFrom-Json
@@ -419,7 +472,7 @@ if ($Destroy) {
         }
 
         if ($PSCmdlet.ShouldProcess($state.Definition.displayName, 'Delete owned Sentinel analytics rule')) {
-            $null = az rest --method DELETE `
+            $null = Invoke-AzChecked rest --method DELETE `
                 --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/$($state.ResourceId)?api-version=2024-03-01" `
                 2>$null
             Write-Host "  Deleted: $($state.Definition.displayName)" -ForegroundColor Green
@@ -428,7 +481,7 @@ if ($Destroy) {
 
     if ($existingWorkbook) {
         if ($PSCmdlet.ShouldProcess($LabWorkbookTitle, 'Delete owned Sentinel workbook')) {
-            $null = az rest --method DELETE --url $workbookResourceUrl 2>$null
+            $null = Invoke-AzChecked rest --method DELETE --url $workbookResourceUrl 2>$null
             Write-Host "  Deleted: $LabWorkbookTitle" -ForegroundColor Green
         }
     } else {
@@ -484,7 +537,7 @@ foreach ($state in $ruleStates) {
         $bodyFile = New-TemporaryFile
         try {
             [System.IO.File]::WriteAllText($bodyFile.FullName, $ruleBody, [System.Text.Encoding]::UTF8)
-            $result = az rest --method PUT `
+            $result = Invoke-AzChecked rest --method PUT `
                 --url "$workspaceId/providers/Microsoft.SecurityInsights/alertRules/${ruleId}?api-version=2024-03-01" `
                 --body "@$($bodyFile.FullName)" `
                 --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
@@ -603,7 +656,7 @@ if ($PSCmdlet.ShouldProcess($LabWorkbookTitle, "$workbookAction Sentinel workboo
     $bodyFile = New-TemporaryFile
     try {
         [System.IO.File]::WriteAllText($bodyFile.FullName, $workbookBody, [System.Text.Encoding]::UTF8)
-        $wbResult = az rest --method PUT `
+        $wbResult = Invoke-AzChecked rest --method PUT `
             --url $workbookResourceUrl `
             --body "@$($bodyFile.FullName)" `
             --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
