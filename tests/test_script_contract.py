@@ -230,7 +230,7 @@ class OAuthScriptContractTests(unittest.TestCase):
         )
 
         guard = script.index("$parsedNextLink.Host -ne 'graph.microsoft.com'")
-        request = script.index("az rest --method GET --url $nextLink")
+        request = script.index("Invoke-AzChecked rest --method GET --url $nextLink")
         self.assertLess(guard, request)
         self.assertIn("$parsedNextLink.Scheme -ne 'https'", script)
         self.assertIn("$parsedNextLink.UserInfo", script)
