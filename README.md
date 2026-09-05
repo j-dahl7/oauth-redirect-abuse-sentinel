@@ -251,14 +251,53 @@ Run the audit independently:
 ./hardening/Audit-OAuthApps.ps1 -OutputPath "./oauth-audit-report.csv"
 ```
 
-The audit checks every app registration for:
+The read-only audit pages through local application registrations, tenant
+service principals (including third-party enterprise apps and managed
+identities), delegated permission grants, and each service principal's
+outbound `appRoleAssignments`. It joins local registrations to their service
+principals without duplicating them, and also checks principals that have no
+local registration. Its review checks cover:
 - Suspicious redirect URI domains (ngrok, herokuapp, workers.dev, etc.)
-- Non-HTTPS redirect URIs (excluding localhost)
+- HTTP redirect URIs, except the exact parsed loopback hosts `localhost`,
+  `127.0.0.1`, and `[::1]`; loopback text in a remote host, path, or query is not exempt
 - High-privilege delegated permissions (Mail.Read, Files.ReadWrite.All, etc.)
 - User-consented vs admin-consented permissions
-- Multi-tenant app registrations
+- Multi-tenant audience declarations
+- Granted application permissions, resolving each role ID against the resource
+  service principal's `appRoles`; custom roles and default access are review
+  candidates too, and missing resources/role definitions are labeled unresolved
 
-Output is a CSV sorted by risk score.
+Application redirect URIs and enterprise-app `replyUrls` are both checked.
+The report identifies each object's type, service-principal ID/type, presence
+of a local registration, and recorded owner-organization ID (when available), keeps
+delegated and application permissions in separate columns, and retains API
+resource IDs so identical permission names are not confused across resources.
+Permission-name and URI flags are triage heuristics, not proof of maliciousness
+or an exhaustive privilege ranking. The numeric score counts matched flags.
+
+The existing **Directory.Read.All** read permission covers this complete audit
+path, with an endpoint-supported Entra role for delegated execution. The audit
+does not request or require extra Graph write permissions and makes only GET
+requests. See Microsoft's [delegated-grant list](https://learn.microsoft.com/en-us/graph/api/oauth2permissiongrant-list?view=graph-rest-1.0),
+[service-principal list](https://learn.microsoft.com/en-us/graph/api/serviceprincipal-list?view=graph-rest-1.0),
+and [outbound app-role assignment list](https://learn.microsoft.com/en-us/graph/api/serviceprincipal-list-approleassignments?view=graph-rest-1.0).
+
+Output is a CSV sorted by risk score. Spreadsheet-formula-like text is prefixed
+with an apostrophe in exported string fields; the analysis uses original values.
+Treat the CSV as sensitive tenant inventory. A failed, malformed, cyclic, or
+off-host Graph page aborts before export rather than reporting a partial scan as
+clean. Unmatched delegated clients also abort, since replication or an incomplete
+inventory can explain them. A failed run leaves any prior output file unchanged;
+do not treat that older file as a result from the failed run.
+
+This is an Azure public-cloud, read-only snapshot and can encounter Graph
+replication delays or throttling. Per-principal permission enumeration adds
+requests; a denied or throttled read fails the run and can be retried later.
+An empty findings set means only that these checks found no candidates. It does
+not audit home-tenant registration settings for external apps, effective Azure
+RBAC/Entra roles, resource-specific consent, credential validity, sign-in activity,
+or permissions requested but never granted. No live tenant result is claimed by
+the offline fixtures.
 
 ---
 
