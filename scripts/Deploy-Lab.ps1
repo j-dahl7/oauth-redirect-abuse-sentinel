@@ -1,4 +1,4 @@
-#Requires -Version 7.4
+#Requires -Version 7.6
 <#
 .SYNOPSIS
     Deploys the OAuth Redirect Abuse Detection Lab.
@@ -202,23 +202,30 @@ $rules = @(
         description = "Detects OAuth consent grants where the user session shows phishing risk indicators."
         severity    = "High"
         query       = @"
+// Keep correlation history on both sides; emit only newly ingested matches.
 let PhishingWindow = 15m;
 let RiskySignIns = SigninLogs
     | where TimeGenerated > ago(1d)
+    | extend SignInIngested = ingestion_time(), SignInUserId = tolower(UserId)
+    | where isnotempty(SignInUserId)
     | where RiskLevelDuringSignIn in ("high", "medium")
-        or RiskEventTypes_V2 has_any ("unfamiliarFeatures", "anonymizedIPAddress", "maliciousIPAddress", "suspiciousIPAddress", "malwareInfectedIPAddress", "suspiciousBrowser")
-    | project SignInTime = TimeGenerated, UserPrincipalName, IPAddress, RiskLevelDuringSignIn, RiskEventTypes_V2, CorrelationId;
+        or RiskEventTypes_V2 has_any ("unfamiliarFeatures", "anonymizedIPAddress", "nationStateIP", "authenticatorPhishing", "anomalousToken", "investigationsThreatIntelligence", "maliciousIPAddress", "suspiciousBrowser")
+    | project SignInTime = TimeGenerated, SignInIngested, SignInUserId, UserPrincipalName, IPAddress, RiskLevelDuringSignIn, RiskEventTypes_V2, CorrelationId;
 AuditLogs
 | where TimeGenerated > ago(1d)
 | where OperationName == "Consent to application"
+| extend ConsentIngested = ingestion_time(), ConsentUserId = tolower(tostring(InitiatedBy.user.id))
+| where isnotempty(ConsentUserId)
 | extend ConsentInitiatedBy = tostring(InitiatedBy.user.userPrincipalName)
 | extend AppDisplayName = tostring(TargetResources[0].displayName)
 | extend AppId = tostring(TargetResources[0].id)
 | extend ConsentPermissions = tostring(TargetResources[0].modifiedProperties)
-| join kind=inner (RiskySignIns) on `$left.ConsentInitiatedBy == `$right.UserPrincipalName
+| join kind=inner (RiskySignIns) on `$left.ConsentUserId == `$right.SignInUserId
 | where TimeGenerated between (SignInTime .. (SignInTime + PhishingWindow))
+| where max_of(ConsentIngested, SignInIngested) > ago(1h)
 | project
     TimeGenerated,
+    ConsentUserId,
     UserPrincipalName = ConsentInitiatedBy,
     AppDisplayName,
     AppId,
@@ -229,7 +236,11 @@ AuditLogs
 "@
         tactics        = @("InitialAccess")
         techniques     = @("T1566")
-        subTechniques  = @("T1566.002")
+        subTechniques  = @()
+        entityMappings = @(
+            @{ entityType = 'Account'; fieldMappings = @(@{ identifier = 'AadUserId'; columnName = 'ConsentUserId' }) },
+            @{ entityType = 'IP'; fieldMappings = @(@{ identifier = 'Address'; columnName = 'SourceIP' }) }
+        )
     },
     @{
         displayName = "LAB - Suspicious OAuth Redirect URI Registered"
@@ -237,10 +248,11 @@ AuditLogs
         severity    = "Medium"
         query       = @"
 // Match exact hosts or their subdomains after parsing each absolute redirect URI.
-let SuspiciousHostRegex = @"^([a-z0-9-]+\.)*(ngrok\.io|ngrok-free\.app|trycloudflare\.com|serveo\.net|localtunnel\.me|workers\.dev|pages\.dev|herokuapp\.com|netlify\.app|vercel\.app|github\.io|gitlab\.io|surge\.sh|glitch\.me|replit\.dev|powerappsportals\.com|webhook\.site|requestbin\.com|pipedream\.com|bit\.ly|tinyurl\.com|t\.co|rebrand\.ly)$";
+let SuspiciousHostRegex = @"^([a-z0-9-]+\.)*(ngrok\.io|ngrok-free\.app|ngrok-free\.dev|ngrok\.app|ngrok\.dev|ngrok\.pizza|trycloudflare\.com|serveo\.net|localtunnel\.me|loca\.lt|workers\.dev|pages\.dev|herokuapp\.com|netlify\.app|vercel\.app|github\.io|gitlab\.io|surge\.sh|glitch\.me|replit\.dev|powerappsportals\.com|webhook\.site|requestbin\.com|pipedream\.com|bit\.ly|tinyurl\.com|t\.co|rebrand\.ly)`$";
 let ApprovedHttpLoopbackHosts = dynamic(["localhost", "127.0.0.1"]);
 AuditLogs
 | where TimeGenerated > ago(1d)
+| where ingestion_time() > ago(1h)
 | where OperationName in ("Add application", "Update application")
 | mv-expand ModifiedProperty = TargetResources[0].modifiedProperties
 | where ModifiedProperty.displayName == "AppAddress"
@@ -271,7 +283,8 @@ AuditLogs
 | mv-expand RedirectUri = AddedRedirectUris to typeof(string)
 | extend ParsedRedirectUri = parse_url(RedirectUri)
 | extend RedirectScheme = tolower(tostring(ParsedRedirectUri.Scheme)),
-    RedirectHost = tolower(tostring(ParsedRedirectUri.Host))
+    RedirectHost = trim_end(@"\.", tolower(tostring(ParsedRedirectUri.Host)))
+| extend InitiatedByUserId = tostring(InitiatedBy.user.id)
 | extend InitiatedByUser = tostring(InitiatedBy.user.userPrincipalName)
 | extend InitiatedByApp = tostring(InitiatedBy.app.displayName)
 | extend AppName = tostring(TargetResources[0].displayName)
@@ -287,12 +300,17 @@ AuditLogs
     OldRedirectUris,
     RedirectUri,
     RedirectHost,
+    InitiatedByUserId,
     InitiatedByUser,
     InitiatedByApp
 "@
         tactics        = @("Persistence")
         techniques     = @("T1098")
         subTechniques  = @()
+        entityMappings = @(
+            @{ entityType = 'Account'; fieldMappings = @(@{ identifier = 'AadUserId'; columnName = 'InitiatedByUserId' }) },
+            @{ entityType = 'URL'; fieldMappings = @(@{ identifier = 'Url'; columnName = 'RedirectUri' }) }
+        )
     },
     @{
         displayName        = "LAB - OAuth Error Cluster by Application"
@@ -321,6 +339,7 @@ let ApprovedAppIds = dynamic([
 ]);
 SigninLogs
 | where TimeGenerated > ago(1d)
+| extend SourceIngested = ingestion_time()
 | where ResultType in (
     "65001",   // User or administrator has not consented; interaction is required
     "65004",   // User declined consent
@@ -337,12 +356,14 @@ SigninLogs
 | extend AppIdUsed = AppId
 | where isempty(AppIdUsed) or AppIdUsed !in~ (ApprovedAppIds)
 | summarize
+    LastIngested = max(SourceIngested),
     ErrorCount = count(),
     DistinctUsers = dcount(UserPrincipalName),
     Users = make_set(UserPrincipalName, 10),
     ErrorCodes = make_set(ResultType),
     IPs = make_set(IPAddress, 10)
     by AppName, AppIdUsed, bin(TimeGenerated, 1h)
+| where LastIngested > ago(1h)
 | where ErrorCount > 3 or DistinctUsers > 2
 | project
     TimeGenerated,
@@ -357,16 +378,18 @@ SigninLogs
         tactics        = @()
         techniques     = @()
         subTechniques  = @()
+        entityMappings = @()
     },
     @{
         displayName = "LAB - Bulk OAuth Consent to Single App"
-        description = "Detects when multiple users consent to the same OAuth app within a short window, indicating a phishing campaign."
+        description = "Detects three distinct users consenting to one OAuth app in a fixed UTC hour bin; a triage signal requiring investigation."
         severity    = "High"
         query       = @"
 let ConsentUserThreshold = 3;
 let TimeWindow = 1h;
 AuditLogs
 | where TimeGenerated > ago(1d)
+| extend SourceIngested = ingestion_time()
 | where OperationName == "Consent to application"
 | extend ConsentUserId = tolower(tostring(InitiatedBy.user.id)),
     ConsentUser = tostring(InitiatedBy.user.userPrincipalName)
@@ -374,6 +397,7 @@ AuditLogs
 | extend AppDisplayName = tostring(TargetResources[0].displayName)
 | extend AppId = tostring(TargetResources[0].id)
 | summarize
+    LastIngested = max(SourceIngested),
     ConsentEventCount = count(),
     DistinctConsentUsers = dcount(ConsentUserId),
     ConsentUserIds = make_set(ConsentUserId, 20),
@@ -381,6 +405,7 @@ AuditLogs
     FirstConsent = min(TimeGenerated),
     LastConsent = max(TimeGenerated)
     by AppDisplayName, AppId, bin(TimeGenerated, TimeWindow)
+| where LastIngested > ago(1h)
 | where DistinctConsentUsers >= ConsentUserThreshold
 | project
     TimeGenerated,
@@ -394,7 +419,8 @@ AuditLogs
 "@
         tactics        = @("InitialAccess")
         techniques     = @("T1566")
-        subTechniques  = @("T1566.002")
+        subTechniques  = @()
+        entityMappings = @()
     }
 )
 
@@ -516,12 +542,13 @@ foreach ($state in $ruleStates) {
             suppressionEnabled    = $false
             tactics               = $rule.tactics
             techniques            = $rule.techniques
-            subTechniques         = $rule.subTechniques
+            eventGroupingSettings = @{ aggregationKind = "AlertPerResult" }
+            entityMappings        = $rule.entityMappings
             enabled               = $true
             incidentConfiguration = @{
                 createIncident        = $true
                 groupingConfiguration = @{
-                    enabled               = $true
+                    enabled               = $false
                     reopenClosedIncident  = $false
                     lookbackDuration      = "PT5H"
                     matchingMethod        = "AllEntities"
@@ -631,10 +658,13 @@ $workbookContent = @'
       "name": "top-consent-apps"
     }
   ],
-  "fallbackResourceIds": ["placeholder"],
-  "fromTemplateId": "sentinel-OAuthSecurityDashboard"
+  "fallbackResourceIds": []
 }
 '@
+
+$workbookObject = $workbookContent | ConvertFrom-Json
+$workbookObject.fallbackResourceIds = @($workspaceId)
+$workbookContent = $workbookObject | ConvertTo-Json -Depth 30
 
 $workbookAction = if ($existingWorkbook) { "Updated" } else { "Created" }
 $workbookBody = @{

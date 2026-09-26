@@ -2,3 +2,8 @@ __pycache__/
 *.py[cod]
 .oauth-hardening-manifest.json
 .oauth-hardening-manifest.json.*.tmp
+
+# Tenant inventory reports and private staging files
+oauth-audit-report.csv
+*.csv.*.tmp
+reports/

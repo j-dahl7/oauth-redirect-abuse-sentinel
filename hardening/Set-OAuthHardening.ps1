@@ -1,4 +1,4 @@
-#Requires -Version 7.4
+#Requires -Version 7.6
 <#
 .SYNOPSIS
     Applies or rolls back explicitly owned OAuth hardening changes in Microsoft Entra ID.
@@ -55,7 +55,7 @@ param(
     [string[]]$ExcludedUserIds = @(),
 
     [Parameter()]
-    [string]$ManifestPath = (Join-Path $PSScriptRoot '.oauth-hardening-manifest.json'),
+    [string]$ManifestPath = (Join-Path $PSScriptRoot '../.oauth-hardening-manifest.json'),
 
     [Parameter()]
     [switch]$Rollback
@@ -64,6 +64,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 . (Join-Path $PSScriptRoot '../scripts/Invoke-AzChecked.ps1')
+. (Join-Path $PSScriptRoot '../scripts/Private-Report.ps1')
 $ManifestOwner = 'nine-lives-zero-trust:oauth-redirect-abuse-sentinel'
 $ManifestSchemaVersion = 1
 $CaDisplayName = 'LAB - Require MFA for Risky OAuth Sign-ins'
@@ -325,24 +326,17 @@ function Write-OwnerOnlyManifest {
         Assert-OwnerOnlyManifest $fullPath
     }
 
-    # Create an empty staging file first, lock its permissions down, and only
-    # then place manifest content in it. Sensitive rollback state is therefore
-    # never present in a newly created file while inherited/default ACLs apply.
+    # Create owner-only before another process can open the staging file;
+    # chmod/ACL updates cannot revoke an already-open foreign read handle.
     $temporaryPath = "$fullPath.$([guid]::NewGuid().ToString('N')).tmp"
     try {
-        $stream = [System.IO.File]::Open(
-            $temporaryPath,
-            [System.IO.FileMode]::CreateNew,
-            [System.IO.FileAccess]::Write,
-            [System.IO.FileShare]::None
-        )
+        $stream = New-OwnerOnlyFileStream -Path $temporaryPath
         try {
             $stream.Flush($true)
         } finally {
             $stream.Dispose()
         }
 
-        Set-OwnerOnlyFilePermissions $temporaryPath
         Assert-OwnerOnlyManifest $temporaryPath
         $contentStream = [System.IO.File]::Open(
             $temporaryPath,
@@ -421,9 +415,11 @@ function Invoke-GraphJsonRequest {
         return Invoke-AzChecked rest --method DELETE --url $Url
     }
 
-    $bodyFile = New-TemporaryFile
+    $bodyFile = [System.IO.FileInfo]::new((Join-Path ([IO.Path]::GetTempPath()) ("oauth-policy-$([guid]::NewGuid().ToString('N')).json")))
+    $privateStream = New-OwnerOnlyFileStream -Path $bodyFile.FullName
+    $privateStream.Dispose()
     try {
-        Set-OwnerOnlyFilePermissions $bodyFile.FullName
+        Assert-OwnerOnlyManifest $bodyFile.FullName
         [System.IO.File]::WriteAllText(
             $bodyFile.FullName,
             $JsonBody,
@@ -444,6 +440,10 @@ function Get-ExactConditionalAccessPolicy {
     if ([string]::IsNullOrWhiteSpace($PolicyId)) {
         return $null
     }
+    $parsedId = [guid]::Empty
+    if (-not [guid]::TryParse($PolicyId, [ref]$parsedId) -or $parsedId -eq [guid]::Empty) {
+        throw 'Manifest-owned Conditional Access policy ID is invalid.'
+    }
     # A failed read, including HTTP 404, is not proof this operation deleted
     # the owned policy. Retain the manifest for investigation of external drift.
     return Invoke-AzChecked rest --method GET --url "$ConditionalAccessPoliciesUrl/$PolicyId" `
@@ -457,35 +457,54 @@ function Get-AuthorizationPolicy {
 
 function Get-AllConditionalAccessPolicies {
     $nextUrl = $ConditionalAccessPoliciesUrl
-    $visited = [System.Collections.Generic.HashSet[string]]::new(
-        [System.StringComparer]::Ordinal
-    )
+    $visited = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $policyIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $policies = [System.Collections.Generic.List[object]]::new()
-
     while (-not [string]::IsNullOrWhiteSpace($nextUrl)) {
-        if (-not $visited.Add($nextUrl)) {
-            throw 'Conditional Access policy pagination returned a repeated nextLink.'
+        if ($visited.Count -ge 1000 -or -not $visited.Add($nextUrl)) {
+            throw 'Conditional Access policy pagination returned a repeated nextLink or exceeded 1000 pages.'
         }
-
+        $parsedNextLink = $null
+        if (-not [Uri]::TryCreate($nextUrl, [UriKind]::Absolute, [ref]$parsedNextLink) -or
+            $parsedNextLink.Scheme -ne 'https' -or $parsedNextLink.Host -ne 'graph.microsoft.com' -or
+            $parsedNextLink.UserInfo -or $parsedNextLink.Port -ne 443 -or $parsedNextLink.Fragment -or
+            $parsedNextLink.AbsolutePath -cne '/v1.0/identity/conditionalAccess/policies') {
+            throw 'Refusing unsafe Microsoft Graph Conditional Access pagination URL.'
+        }
         $page = Invoke-AzChecked rest --method GET --url $nextUrl 2>$null | ConvertFrom-Json
-        foreach ($policy in @($page.value)) {
+        if (-not $page -or $page.value -isnot [array]) {
+            throw 'Microsoft Graph returned an invalid Conditional Access collection.'
+        }
+        foreach ($policy in $page.value) {
+            $policyId = [guid]::Empty
+            if (-not $policy -or -not [guid]::TryParse([string]$policy.id, [ref]$policyId) -or
+                $policyId -eq [guid]::Empty -or -not $policyIds.Add([string]$policy.id)) {
+                throw 'Microsoft Graph returned a missing, invalid, or repeated Conditional Access policy ID.'
+            }
             $policies.Add($policy)
         }
-
-        $nextUrl = [string]$page.'@odata.nextLink'
-        if (-not [string]::IsNullOrWhiteSpace($nextUrl)) {
-            $parsedNextLink = [uri]$nextUrl
-            if (
-                $parsedNextLink.Scheme -ne 'https' -or
-                $parsedNextLink.Host -ne 'graph.microsoft.com' -or
-                $parsedNextLink.UserInfo
-            ) {
-                throw "Refusing unsafe Microsoft Graph pagination URL '$nextUrl'."
-            }
+        $link = $page.'@odata.nextLink'
+        if ($null -ne $link -and $link -isnot [string]) {
+            throw 'Microsoft Graph returned an invalid Conditional Access nextLink.'
         }
+        $nextUrl = $link
     }
-
     return @($policies)
+}
+
+function Get-IntendedConsentCollection {
+    param([AllowEmptyCollection()][object[]]$Current)
+    $selfPolicies = @($Current | Where-Object { $_ -like 'managePermissionGrantsForSelf.*' })
+    if ($selfPolicies.Count -eq 0) { return $Current }
+    $supported = @('managePermissionGrantsForSelf.microsoft-user-default-legacy',
+        'managePermissionGrantsForSelf.microsoft-user-default-low')
+    if (@($selfPolicies | Where-Object { $_ -notin $supported }).Count -gt 0) {
+        throw 'Custom user-consent policy detected; review its restrictions before changing it. No changes applied.'
+    }
+    # Preserve disabled user consent and every unrelated grant policy. Switching
+    # a custom, possibly narrower policy to default-low could broaden access.
+    return @($Current | Where-Object { $_ -notlike 'managePermissionGrantsForSelf.*' }) +
+        'managePermissionGrantsForSelf.microsoft-user-default-low'
 }
 
 function Assert-ExactTenantConfirmation {
@@ -614,6 +633,7 @@ function Invoke-HardeningRollback {
         [Parameter(Mandatory)]
         [object]$AuthorizationPolicy,
         [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
         [object[]]$AllPolicies,
         [Parameter(Mandatory)]
         [string]$ResolvedManifestPath
@@ -784,15 +804,16 @@ $caPolicyHash = Get-ConditionalAccessHash $caPolicyObject
 $currentConsent = @(
     $authorizationPolicy.defaultUserRolePermissions.permissionGrantPoliciesAssigned
 )
-$intendedConsent = @(
-    $currentConsent | Where-Object { $_ -like 'managePermissionGrantsForOwnedResource.*' }
-)
-$intendedConsent += 'managePermissionGrantsForSelf.microsoft-user-default-low'
+$intendedConsent = @(Get-IntendedConsentCollection -Current $currentConsent)
 $intendedConsent = @(Get-NormalizedStringArray $intendedConsent)
 
 if ($manifest) {
     if ($manifest.state -eq 'rolled-back') {
         throw "Manifest '$resolvedManifestPath' is a completed rollback record. Archive it and choose a new manifest path for a new apply operation."
+    }
+    $safeIntended = @(Get-IntendedConsentCollection -Current @($manifest.authorizationPolicy.originalPermissionGrantPoliciesAssigned))
+    if (-not (Test-EquivalentStringArrays $safeIntended $manifest.authorizationPolicy.intendedPermissionGrantPoliciesAssigned)) {
+        throw 'Existing manifest would widen or discard consent settings under the current contract. Use its reviewed rollback before starting a new apply.'
     }
     if (-not (Test-EquivalentStringArrays $manifest.conditionalAccess.excludedUserIds $reviewedExclusions)) {
         throw 'ExcludedUserIds differ from the immutable ownership manifest. Roll back first; do not mutate an owned CA policy in place.'
@@ -816,7 +837,7 @@ if ($manifest) {
             originalPermissionGrantPoliciesAssigned = @($currentConsent)
             intendedPermissionGrantPoliciesAssigned = @($intendedConsent)
             intendedHash = Get-Sha256Hex (
-                @($intendedConsent) | ConvertTo-Json -Compress
+                ConvertTo-Json -InputObject @($intendedConsent) -Compress
             )
         }
         conditionalAccess = [pscustomobject]@{
@@ -885,10 +906,11 @@ if (-not $ownedPolicy) {
             -Method POST `
             -Url $ConditionalAccessPoliciesUrl `
             -JsonBody $caPolicyJson | ConvertFrom-Json
-        $createdPolicyId = [string]$created.id
-        if ([string]::IsNullOrWhiteSpace($createdPolicyId)) {
-            throw 'Graph did not return the immutable ID of the created Conditional Access policy.'
+        $parsedCreatedId = [guid]::Empty
+        if (-not [guid]::TryParse([string]$created.id, [ref]$parsedCreatedId) -or $parsedCreatedId -eq [guid]::Empty) {
+            throw 'Graph did not return a valid immutable ID of the created Conditional Access policy.'
         }
+        $createdPolicyId = [string]$created.id
         $manifest.conditionalAccess.id = $createdPolicyId
         $manifest.state = 'ca-created'
         $manifest.lastError = $null
@@ -900,7 +922,9 @@ if (-not $ownedPolicy) {
             -ExpectedId $ownedPolicyId `
             -ExpectedHash ([string]$manifest.conditionalAccess.intendedHash)
     } catch {
-        $manifest.state = if ($createdPolicyId) { 'ca-created-manifest-failed' } else { 'ca-create-uncertain' }
+        $manifest.state = if ($createdPolicyId) { 'ca-created-manifest-failed' }
+            elseif ($_.Exception.Data['DefinitiveRejection'] -eq $true) { 'prepared' }
+            else { 'ca-create-uncertain' }
         $manifest.lastError = $_.Exception.Message
         if ($createdPolicyId) {
             try {
@@ -1014,7 +1038,7 @@ $manifest.appliedAtUtc = [DateTime]::UtcNow.ToString('o')
 $manifest.lastError = $null
 Write-OwnerOnlyManifest -Manifest $manifest -Path $resolvedManifestPath
 
-Write-Host '  User consent restricted to the intended low-risk policy collection.' -ForegroundColor Green
+Write-Host '  User consent matches the reviewed intended collection (disabled consent stays disabled).' -ForegroundColor Green
 Write-Host "  CA policy remains report-only; exact ID: $ownedPolicyId" -ForegroundColor Green
 Write-Host "  Ownership/rollback manifest: $resolvedManifestPath" -ForegroundColor Green
 

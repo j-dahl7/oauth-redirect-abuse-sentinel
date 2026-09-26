@@ -1,20 +1,102 @@
-# Explicit native exit checking also works when PowerShell's native-error
-# experimental feature is unavailable or disabled. Never stream failed output
-# into a JSON parser or let an unsuccessful delete look like a completed write.
-function Invoke-AzChecked {
-    $previousNativePreference = $PSNativeCommandUseErrorActionPreference
-    $PSNativeCommandUseErrorActionPreference = $false
+#Requires -Version 7.6
+function Invoke-OAuthAzText {
+    param(
+        [Parameter(Mandatory)]
+        [string[]]$Arguments,
+
+        [switch]$NotFoundIsNull
+    )
+
     $global:LASTEXITCODE = 0
-    try {
-        $output = & az @args
+    $command = Get-Command az -ErrorAction Stop
+    if ($command.CommandType -in @('Function', 'Filter')) {
+        # Preserve the offline harness contract while keeping its error stream
+        # separate from JSON, just like the native-process path below.
+        $errors = [System.Collections.Generic.List[string]]::new()
+        $previousNativePreference = $PSNativeCommandUseErrorActionPreference
+        $PSNativeCommandUseErrorActionPreference = $false
+        try {
+        $output = @(& az @Arguments 2>&1 | ForEach-Object {
+            if ($_ -is [System.Management.Automation.ErrorRecord]) { $errors.Add([string]$_) }
+            else { $_ }
+        })
         $exitCode = $LASTEXITCODE
+        } finally { $PSNativeCommandUseErrorActionPreference = $previousNativePreference }
+        $stderr = $errors -join "`n"
+        $text = ($output | Out-String).Trim()
     }
-    finally {
-        $PSNativeCommandUseErrorActionPreference = $previousNativePreference
+    else {
+        $start = [System.Diagnostics.ProcessStartInfo]::new()
+        $start.FileName = $command.Source
+        if ([System.IO.Path]::GetExtension($start.FileName) -in @('.cmd', '.bat')) {
+            # The Windows MSI wrapper expands %* through cmd.exe. Invoke its
+            # bundled Python directly so URLs/JSON remain individual arguments.
+            $python = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $command.Source) '../python.exe'))
+            if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+                throw 'The Azure CLI batch wrapper has no adjacent bundled python.exe; use a supported native Azure CLI installation.'
+            }
+            $start.FileName = $python
+            foreach ($argument in @('-IBm', 'azure.cli')) { $start.ArgumentList.Add($argument) }
+        }
+        foreach ($argument in $Arguments) { $start.ArgumentList.Add($argument) }
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $process = [System.Diagnostics.Process]::new()
+        $process.StartInfo = $start
+        try {
+            if (-not $process.Start()) { throw 'Could not start Azure CLI.' }
+            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+            $stderrTask = $process.StandardError.ReadToEndAsync()
+            $process.WaitForExit()
+            $text = $stdoutTask.GetAwaiter().GetResult().Trim()
+            $stderr = $stderrTask.GetAwaiter().GetResult().Trim()
+            $exitCode = $process.ExitCode
+        }
+        finally { $process.Dispose() }
     }
+    $global:LASTEXITCODE = $exitCode
     if ($exitCode -ne 0) {
-        # Do not echo arguments, response bodies, or credentials in the error.
-        throw "Azure CLI command failed with exit code $exitCode."
+        $errorText = "$stderr`n$text"
+        $providerCode = $null
+        $reason = $null
+        $isNotFound = $false
+        if ($errorText -match '(?im)^\s*(?:ERROR:\s*)?\(([A-Za-z][A-Za-z0-9_.]{0,79})\)') {
+            $providerCode = $Matches[1]
+            $isNotFound = $providerCode -in @('ResourceGroupNotFound', 'ResourceNotFound', 'Request_ResourceNotFound')
+        }
+        elseif ($errorText.Trim() -match '^(?s)(?:ERROR:\s*)?(?<reason>Bad Request|Unauthorized|Forbidden|Not Found|Conflict|Too Many Requests|Internal Server Error|Service Unavailable|Gateway Timeout)\((?<body>\{.*\})\)$') {
+            # az rest wraps the structured provider body in its HTTP reason.
+            # Require both the 404 reason and a known absence code; do not
+            # search arbitrary message text/identifiers for the digits 404.
+            $reason = $Matches.reason
+            $bodyText = $Matches.body
+            try {
+                $candidateCode = [string](($bodyText | ConvertFrom-Json -ErrorAction Stop).error.code)
+                if ($candidateCode -match '^[A-Za-z][A-Za-z0-9_.]{0,79}$') { $providerCode = $candidateCode }
+                $isNotFound = $reason -eq 'Not Found' -and $providerCode -in @('ResourceGroupNotFound', 'ResourceNotFound', 'Request_ResourceNotFound')
+            }
+            catch { $isNotFound = $false }
+        }
+        if ($NotFoundIsNull -and $isNotFound) { $global:LASTEXITCODE = 0; return $null }
+        # Callers may handle this error without exposing a response body or an
+        # argument containing credentials in a terminal/transcript.
+        $errorCode = if ($providerCode) { " ($providerCode)" } else { '' }
+        $failure = [System.InvalidOperationException]::new("Azure CLI command failed with exit code $exitCode$errorCode.")
+        $failure.Data['AzureCliExitCode'] = $exitCode
+        $failure.Data['AzureCliRetryable'] = $providerCode -in @('TooManyRequests', 'Throttled', 'ServiceUnavailable', 'InternalServerError', 'GatewayTimeout', 'PrincipalNotFound', 'Request_ResourceNotFound') -or $reason -in @('Too Many Requests', 'Internal Server Error', 'Service Unavailable', 'Gateway Timeout')
+        # Only an explicit Graph/HTTP rejection is safe to retry as a new POST.
+        # Connection failures, timeouts, 5xx and unrecognized diagnostics remain ambiguous.
+        $failure.Data['DefinitiveRejection'] = $reason -in @('Bad Request', 'Unauthorized', 'Forbidden') -and [bool]$providerCode
+        throw $failure
     }
-    return $output
+    if (-not $text) { return $null }
+    return $text
+}
+
+function Invoke-AzChecked {
+    $arguments = @($args | ForEach-Object { foreach ($value in @($_)) { [string]$value } })
+    $text = Invoke-OAuthAzText -Arguments $arguments
+    if ($text) { return ($text -split "\r?\n") }
 }

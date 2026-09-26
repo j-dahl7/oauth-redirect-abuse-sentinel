@@ -73,6 +73,32 @@ function global:az {
         }
         return (@{tenantId='11111111-1111-1111-1111-111111111111'} | ConvertTo-Json -Compress)
     }
+    if ($args[0] -eq 'rest' -and $args[([array]::IndexOf($args,'--method')+1)] -eq 'POST') {
+        $url=$args[([array]::IndexOf($args,'--url')+1)]
+        if ($url -cne 'https://graph.microsoft.com/v1.0/$batch') { throw 'Unexpected write endpoint' }
+        $bodyPath=$args[([array]::IndexOf($args,'--body')+1)].Substring(1)
+        $body=Get-Content -LiteralPath $bodyPath -Raw | ConvertFrom-Json
+        if ($body.requests.Count -gt 20) { throw 'Batch exceeds Graph limit' }
+        $global:requests.Add($url)
+        $responses=@(foreach ($request in $body.requests) {
+            if ($request.method -cne 'GET') { throw 'Batch attempted a cloud mutation' }
+            $global:requests.Add('https://graph.microsoft.com/v1.0'+$request.url)
+            $key=$request.url.TrimStart('/')
+            if (-not $global:fixture.routes.ContainsKey($key)) { throw "Unexpected batch route: $key" }
+            $route=$global:fixture.routes[$key]
+            if ($route.ContainsKey('nativeFailure')) {
+                & $env:NATIVE_PYTHON -c 'import sys; sys.exit(int(sys.argv[1]))' $route.nativeFailure
+                return
+            }
+            @{id=$request.id; status=200; body=$route}
+        })
+        if ($global:fixture.batchFault -eq 'missing') { $responses=@() }
+        if ($global:fixture.batchFault -eq 'failed') { $responses[0].status=403 }
+        if ($global:fixture.batchFault -eq 'throttled') { $responses[0].status=429 }
+        if ($global:fixture.batchFault -eq 'duplicate') { $responses[1].id=$responses[0].id }
+        [array]::Reverse($responses)
+        return (@{responses=$responses} | ConvertTo-Json -Depth 20 -Compress)
+    }
     if ($args[0] -ne 'rest' -or $args[([array]::IndexOf($args,'--method')+1)] -ne 'GET') {
         throw 'Unexpected non-read command in fixture'
     }
@@ -135,6 +161,7 @@ class OAuthAuditTests(unittest.TestCase):
         self.assertIn(f"{guid(9)}/{guid(500)}:Mail.Read", managed["ApplicationPermissions"])
         self.assertIn("HIGH_PRIV_APPLICATION_PERMISSION:Mail.Read", managed["RiskFlags"])
         self.assertEqual(sum("appRoleAssignments" in url for url in requests), 5)
+        self.assertEqual(sum(url.endswith('/$batch') for url in requests), 2)
         self.assertTrue(any("servicePrincipals?$top=100&" in url for url in requests))
 
     def test_custom_default_and_unresolved_roles_remain_visible(self):
@@ -154,6 +181,40 @@ class OAuthAuditTests(unittest.TestCase):
         self.assertEqual(managed["ApplicationPermissions"].count("UNRESOLVED"), 2)
         self.assertIn("UNRESOLVED_APPLICATION_PERMISSION", managed["RiskFlags"])
         self.assertNotIn("HIGH_PRIV_APPLICATION_PERMISSION", managed["RiskFlags"])
+
+    def test_incomplete_failed_and_duplicate_batch_items_never_export(self):
+        for fault in ('missing', 'failed', 'throttled', 'duplicate'):
+            with self.subTest(fault=fault):
+                scenario = fixture()
+                scenario['batchFault'] = fault
+                result, _, _, raw = self.run_audit(scenario, previous='prior report\n')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(raw, 'prior report\n')
+
+    def test_assignment_nextlink_stays_on_exact_client_collection(self):
+        for link in ('https://graph.microsoft.com:444/v1.0/servicePrincipals/x/appRoleAssignments',
+                     GRAPH + 'users', 'https://other.example/v1.0/users',
+                     GRAPH + f'servicePrincipals/{guid(3)}/appRoleAssignments'):
+            with self.subTest(link=link):
+                scenario = fixture()
+                scenario['routes'][f'servicePrincipals/{guid(3)}/appRoleAssignments']['@odata.nextLink'] = link
+                result, _, _, raw = self.run_audit(scenario)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIsNone(raw)
+
+    def test_two_thousand_principals_use_bounded_batches_and_indexed_grants(self):
+        principals = [principal(number) for number in range(1, 2001)]
+        grants = [{"clientId": guid(number % 2000 + 1), "resourceId": guid(2001),
+                   "scope": "Mail.Read", "consentType": "Principal"} for number in range(5000)]
+        routes = {"applications": collection([]), "servicePrincipals": collection(principals),
+                  "oauth2PermissionGrants": collection(grants)}
+        for sp in principals:
+            routes[f"servicePrincipals/{sp['id']}/appRoleAssignments"] = collection([])
+        result, rows, requests, _ = self.run_audit({"routes": routes})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(rows), 2000)
+        self.assertEqual(sum(url.endswith('/$batch') for url in requests), 100)
+        self.assertTrue(all('USER_CONSENTED_HIGH_PRIV:Mail.Read' in row['RiskFlags'] for row in rows))
 
     def test_http_exemption_uses_exact_loopback_host_and_checks_enterprise_reply_urls(self):
         uris = ["http://localhost/cb", "http://127.0.0.1:9000/cb", "http://[::1]/cb",
