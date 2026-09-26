@@ -103,9 +103,36 @@ if ($IsWindows) {
     $other=@((Get-Acl -LiteralPath $path).Access | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ne $sid })
     if ($other.Count) { throw 'Report readable by other principals' }
 } elseif (([int][IO.File]::GetUnixFileMode($path) -band 63) -ne 0) { throw 'Report has non-owner permissions' }
-function Set-OwnerOnlyFilePermissions { throw 'simulated ACL failure' }
+function New-OwnerOnlyFileStream { throw 'simulated private creation failure' }
 try { Write-OwnerOnlyReport -Path $path -Content 'must-not-replace' } catch {}
 if ([IO.File]::ReadAllText($path) -ne 'second') { throw 'Failed private write replaced report' }
+''')
+
+    def test_private_file_has_owner_only_os_permissions_at_creation(self):
+        self.run_ps(r'''
+$ErrorActionPreference='Stop'
+. (Join-Path $env:LAB_ROOT 'scripts/Private-Report.ps1')
+$path=Join-Path $env:REVIEW_TEMP 'initial-mode.csv'
+function Set-OwnerOnlyFilePermissions { throw 'Initial privacy must not depend on later chmod/ACL updates' }
+$stream=New-OwnerOnlyFileStream -Path $path
+try {
+    # Inspect the actual OS ACL/mode before any content or permission update.
+    if ($IsWindows) {
+        $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $acl=Get-Acl -LiteralPath $path
+        if (-not $acl.AreAccessRulesProtected) { throw 'Initial ACL inherits access' }
+        $other=@($acl.Access | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ne $sid })
+        if ($other.Count) { throw 'Initial ACL grants another principal access' }
+    } else {
+        $mode=[int][IO.File]::GetUnixFileMode($path)
+        if ($mode -ne 384) { throw "Initial mode is not 0600: $mode" }
+    }
+    $stream.WriteByte(65)
+} finally { $stream.Dispose() }
+if ([IO.File]::ReadAllText($path) -ne 'A') { throw 'Private stream not writable' }
+$failed=$false
+try { New-OwnerOnlyFileStream -Path $path } catch { $failed=$true }
+if (-not $failed -or [IO.File]::ReadAllText($path) -ne 'A') { throw 'CreateNew overwrote an existing file' }
 ''')
 
     def test_disabled_consent_survives_full_apply_rerun_and_rollback(self):

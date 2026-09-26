@@ -64,6 +64,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 . (Join-Path $PSScriptRoot '../scripts/Invoke-AzChecked.ps1')
+. (Join-Path $PSScriptRoot '../scripts/Private-Report.ps1')
 $ManifestOwner = 'nine-lives-zero-trust:oauth-redirect-abuse-sentinel'
 $ManifestSchemaVersion = 1
 $CaDisplayName = 'LAB - Require MFA for Risky OAuth Sign-ins'
@@ -325,24 +326,17 @@ function Write-OwnerOnlyManifest {
         Assert-OwnerOnlyManifest $fullPath
     }
 
-    # Create an empty staging file first, lock its permissions down, and only
-    # then place manifest content in it. Sensitive rollback state is therefore
-    # never present in a newly created file while inherited/default ACLs apply.
+    # Create owner-only before another process can open the staging file;
+    # chmod/ACL updates cannot revoke an already-open foreign read handle.
     $temporaryPath = "$fullPath.$([guid]::NewGuid().ToString('N')).tmp"
     try {
-        $stream = [System.IO.File]::Open(
-            $temporaryPath,
-            [System.IO.FileMode]::CreateNew,
-            [System.IO.FileAccess]::Write,
-            [System.IO.FileShare]::None
-        )
+        $stream = New-OwnerOnlyFileStream -Path $temporaryPath
         try {
             $stream.Flush($true)
         } finally {
             $stream.Dispose()
         }
 
-        Set-OwnerOnlyFilePermissions $temporaryPath
         Assert-OwnerOnlyManifest $temporaryPath
         $contentStream = [System.IO.File]::Open(
             $temporaryPath,
@@ -421,9 +415,11 @@ function Invoke-GraphJsonRequest {
         return Invoke-AzChecked rest --method DELETE --url $Url
     }
 
-    $bodyFile = New-TemporaryFile
+    $bodyFile = [System.IO.FileInfo]::new((Join-Path ([IO.Path]::GetTempPath()) ("oauth-policy-$([guid]::NewGuid().ToString('N')).json")))
+    $privateStream = New-OwnerOnlyFileStream -Path $bodyFile.FullName
+    $privateStream.Dispose()
     try {
-        Set-OwnerOnlyFilePermissions $bodyFile.FullName
+        Assert-OwnerOnlyManifest $bodyFile.FullName
         [System.IO.File]::WriteAllText(
             $bodyFile.FullName,
             $JsonBody,

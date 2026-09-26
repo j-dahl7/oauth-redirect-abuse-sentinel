@@ -35,12 +35,13 @@ class OAuthScriptContractTests(unittest.TestCase):
         self.assertIn("Write-OwnerOnlyManifest -Manifest $manifest", script)
         self.assertIn("function Invoke-GraphJsonRequest", script)
         self.assertIn("finally {", script)
-        self.assertEqual(script.count("New-TemporaryFile"), 1)
-        permission_lock = script.index("Set-OwnerOnlyFilePermissions $temporaryPath")
+        self.assertNotIn("New-TemporaryFile", script)
+        self.assertEqual(script.count("New-OwnerOnlyFileStream -Path"), 2)
+        permission_lock = script.index("New-OwnerOnlyFileStream -Path $temporaryPath")
         manifest_write = script.index("$manifestWriter.Write($json)")
         self.assertLess(permission_lock, manifest_write)
         body_permission_lock = script.index(
-            "Set-OwnerOnlyFilePermissions $bodyFile.FullName"
+            "New-OwnerOnlyFileStream -Path $bodyFile.FullName"
         )
         body_write = script.index(
             "[System.IO.File]::WriteAllText(\n            $bodyFile.FullName"

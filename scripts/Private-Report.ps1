@@ -1,4 +1,27 @@
 #Requires -Version 7.6
+function New-OwnerOnlyFileStream {
+    param([Parameter(Mandatory)][string]$Path)
+    if ($IsWindows) {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $acl = [System.Security.AccessControl.FileSecurity]::new()
+        $acl.SetOwner($identity.User)
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $identity.User, [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow))
+        return [System.IO.FileSystemAclExtensions]::Create(
+            [System.IO.FileInfo]::new($Path), [System.IO.FileMode]::CreateNew,
+            [System.Security.AccessControl.FileSystemRights]::Write,
+            [System.IO.FileShare]::None, 4096, [System.IO.FileOptions]::None, $acl)
+    }
+    $options = [System.IO.FileStreamOptions]::new()
+    $options.Mode = [System.IO.FileMode]::CreateNew
+    $options.Access = [System.IO.FileAccess]::Write
+    $options.Share = [System.IO.FileShare]::None
+    $options.UnixCreateMode = [System.IO.UnixFileMode]::UserRead -bor [System.IO.UnixFileMode]::UserWrite
+    return [System.IO.FileStream]::new($Path, $options)
+}
+
 function Set-OwnerOnlyFilePermissions {
     param(
         [Parameter(Mandatory)]
@@ -94,24 +117,18 @@ function Write-OwnerOnlyReport {
         Assert-OwnerOnlyReport $fullPath
     }
 
-    # Create an empty staging file first, lock its permissions down, and only
-    # then place report content in it. Sensitive tenant inventory is therefore
-    # never present in a newly created file while inherited/default ACLs apply.
+    # Owner-only access is part of creation, before any process could open the
+    # staging inode/file. Tightening permissions after creation would not revoke
+    # another local user's already-open read handle.
     $temporaryPath = "$fullPath.$([guid]::NewGuid().ToString('N')).tmp"
     try {
-        $stream = [System.IO.File]::Open(
-            $temporaryPath,
-            [System.IO.FileMode]::CreateNew,
-            [System.IO.FileAccess]::Write,
-            [System.IO.FileShare]::None
-        )
+        $stream = New-OwnerOnlyFileStream -Path $temporaryPath
         try {
             $stream.Flush($true)
         } finally {
             $stream.Dispose()
         }
 
-        Set-OwnerOnlyFilePermissions $temporaryPath
         Assert-OwnerOnlyReport $temporaryPath
         $contentStream = [System.IO.File]::Open(
             $temporaryPath,

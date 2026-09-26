@@ -28,10 +28,13 @@ on the target workspace's `SigninLogs`/`AuditLogs` schema, data connectors,
 volume, and ingestion latency.
 
 Run the current offline suite with `python -m unittest discover -s tests -v`.
-The September 26, 2026 remediation passed 53 offline tests, including disabled
+The September 26, 2026 remediation passed 54 offline tests, including disabled
 consent through apply/rerun/rollback, explicit rejection versus uncertain CA
 creation, native argv/error boundaries, private report replacement, and a
 2,000-principal/5,000-grant fixture using 100 read-only assignment batches.
+Private report, manifest, and request-body staging files receive owner-only
+access atomically at creation; an OS-level regression checks initial permissions
+before any content or later permission update.
 All four deployed rules, five hunts, and four workbook queries also pass offline
 semantic analysis with Microsoft's checksum-pinned Kusto Language 12.4.1
 library against documented column types; mapped result columns are checked.
