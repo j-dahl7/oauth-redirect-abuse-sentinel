@@ -32,6 +32,10 @@ The September 26, 2026 remediation passed 53 offline tests, including disabled
 consent through apply/rerun/rollback, explicit rejection versus uncertain CA
 creation, native argv/error boundaries, private report replacement, and a
 2,000-principal/5,000-grant fixture using 100 read-only assignment batches.
+All four deployed rules, five hunts, and four workbook queries also pass offline
+semantic analysis with Microsoft's checksum-pinned Kusto Language 12.4.1
+library against documented column types; mapped result columns are checked.
+Dynamic audit payload shapes and actual matches still require tenant validation.
 It includes paginated Sentinel ownership/collision checks and native-command
 failure tests; no Azure or Graph request is forwarded by the test harnesses.
 The deployer and hardening script check Azure CLI exit codes explicitly, so a

@@ -40,4 +40,3 @@ jobs:
           if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne '154C176AC9C1C4AE9CF0BC53B74354C9D35798FF587F81FE6E0005028A0A1961') { throw 'Kusto language package checksum mismatch' }
           Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $directory 'package')
           ./scripts/Test-QuerySyntax.ps1 -KustoAssembly (Join-Path $directory 'package/lib/net6.0/Kusto.Language.dll')
-
