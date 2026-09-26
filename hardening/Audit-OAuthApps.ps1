@@ -1,4 +1,4 @@
-#Requires -Version 7.4
+#Requires -Version 7.6
 <#
 .SYNOPSIS
     Reviews local app registrations and tenant service principals for permission and redirect-URI findings.
@@ -38,6 +38,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 . (Join-Path $PSScriptRoot '../scripts/Invoke-AzChecked.ps1')
+. (Join-Path $PSScriptRoot '../scripts/Private-Report.ps1')
 
 function Get-GraphCollection {
     [CmdletBinding()]
@@ -46,12 +47,13 @@ function Get-GraphCollection {
         [string]$Uri
     )
 
-    $items = @()
+    $items = [System.Collections.Generic.List[object]]::new()
+    $initialPath = ([Uri]$Uri).AbsolutePath
     $nextLink = $Uri
     $seenLinks = [System.Collections.Generic.HashSet[string]]::new()
 
     while ($nextLink) {
-        if (-not $seenLinks.Add($nextLink)) {
+        if ($seenLinks.Count -ge 10000 -or -not $seenLinks.Add($nextLink)) {
             throw "Microsoft Graph returned a pagination cycle for '$Uri'"
         }
 
@@ -61,7 +63,8 @@ function Get-GraphCollection {
             $parsedNextLink.Scheme -ne 'https' -or
             $parsedNextLink.Host -ne 'graph.microsoft.com' -or
             $parsedNextLink.UserInfo -or
-            (-not $parsedNextLink.IsDefaultPort -and $parsedNextLink.Port -ne 443)
+            (-not $parsedNextLink.IsDefaultPort -and $parsedNextLink.Port -ne 443) -or
+            $parsedNextLink.Fragment -or $parsedNextLink.AbsolutePath -cne $initialPath
         ) {
             throw "Microsoft Graph returned an unsafe pagination URL; refusing to forward credentials"
         }
@@ -74,7 +77,7 @@ function Get-GraphCollection {
             throw 'Microsoft Graph returned an invalid pagination link'
         }
 
-        $items += @($response.value)
+        foreach ($item in $response.value) { $items.Add($item) }
         $nextLink = $response.'@odata.nextLink'
     }
 
@@ -109,11 +112,11 @@ $HighPrivilegeScopes = @(
 
 # Suspicious redirect URI patterns
 $SuspiciousPatterns = @(
-    'ngrok.io', 'ngrok-free.app', 'workers.dev', 'pages.dev',
+    'ngrok.io', 'ngrok-free.app', 'ngrok-free.dev', 'ngrok.app', 'ngrok.dev', 'ngrok.pizza', 'workers.dev', 'pages.dev',
     'herokuapp.com', 'netlify.app', 'vercel.app',
     'github.io', 'gitlab.io', 'surge.sh', 'glitch.me', 'replit.dev',
     'powerappsportals.com',
-    'trycloudflare.com', 'serveo.net', 'localtunnel.me',
+    'trycloudflare.com', 'serveo.net', 'localtunnel.me', 'loca.lt',
     'bit.ly', 'tinyurl.com', 't.co', 'rebrand.ly',
     'webhook.site', 'requestbin.com', 'pipedream.com'
 )
@@ -142,25 +145,79 @@ foreach ($sp in $spList) {
     $spById[$sp.id] = $sp
     if ($sp.appId) { $spByAppId[$sp.appId] = $sp }
 }
+$grantsByClientId = @{}
 foreach ($grant in $grantList) {
     if (-not $grant.clientId -or -not $spById.ContainsKey($grant.clientId)) {
         throw 'A delegated grant client was absent from the service-principal inventory. Rerun after directory replication; refusing a partial report.'
     }
+    if (-not $grantsByClientId.ContainsKey($grant.clientId)) {
+        $grantsByClientId[$grant.clientId] = [System.Collections.Generic.List[object]]::new()
+    }
+    $grantsByClientId[$grant.clientId].Add($grant)
 }
 
 # Read every client relationship, not appRoleAssignedTo (which lists inbound grants).
-# Do not use a nested $expand: each assignment collection can have its own nextLink.
+# The batch envelope is POST, but every subrequest is GET. Responses can arrive
+# out of order; require exactly one successful response per requested ID.
+# Each collection keeps its own guarded nextLink and full pagination history.
 Write-Host "[4/6] Fetching granted application permissions..." -ForegroundColor Yellow
 $assignmentsBySpId = @{}
+$pending = [System.Collections.Generic.Queue[object]]::new()
+$visitedAssignmentLinks = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 foreach ($sp in $spList) {
     $uri = 'https://graph.microsoft.com/v1.0/servicePrincipals/{0}/appRoleAssignments' -f $sp.id
-    $assignments = @(Get-GraphCollection -Uri $uri)
-    foreach ($assignment in $assignments) {
-        if ($assignment.principalId -ne $sp.id -or -not $assignment.resourceId -or -not $assignment.appRoleId) {
-            throw 'Microsoft Graph returned an invalid client app-role assignment; refusing a partial report'
+    $assignmentsBySpId[$sp.id] = [System.Collections.Generic.List[object]]::new()
+    $pending.Enqueue(@{ SpId = $sp.id; Uri = $uri; Page = 1 })
+}
+while ($pending.Count -gt 0) {
+    $requests = [System.Collections.Generic.List[object]]::new()
+    $byRequestId = @{}
+    while ($pending.Count -gt 0 -and $requests.Count -lt 20) {
+        $entry = $pending.Dequeue()
+        $parsed = $null
+        $expectedPath = '/v1.0/servicePrincipals/{0}/appRoleAssignments' -f $entry.SpId
+        if ($entry.Page -gt 10000 -or -not $visitedAssignmentLinks.Add($entry.Uri) -or
+            -not [Uri]::TryCreate($entry.Uri, [UriKind]::Absolute, [ref]$parsed) -or
+            $parsed.Scheme -ne 'https' -or $parsed.Host -ne 'graph.microsoft.com' -or
+            $parsed.Port -ne 443 -or $parsed.UserInfo -or $parsed.Fragment -or
+            $parsed.AbsolutePath -cne $expectedPath) {
+            throw 'Microsoft Graph returned an unsafe, cyclic, or excessive app-role pagination link.'
         }
+        $requestId = [string]($requests.Count + 1)
+        $byRequestId[$requestId] = $entry
+        $requests.Add(@{ id = $requestId; method = 'GET'; url = $parsed.PathAndQuery.Substring('/v1.0'.Length) })
     }
-    $assignmentsBySpId[$sp.id] = $assignments
+    $batchPath = Join-Path ([IO.Path]::GetTempPath()) ("oauth-read-batch-$([guid]::NewGuid().ToString('N')).json")
+    try {
+        Write-OwnerOnlyReport -Path $batchPath -Content (@{ requests = @($requests) } | ConvertTo-Json -Depth 8)
+        $batch = Invoke-AzChecked rest --method POST --url 'https://graph.microsoft.com/v1.0/$batch' `
+            --headers 'Content-Type=application/json' --body "@$batchPath" | ConvertFrom-Json
+    } finally {
+        Remove-Item -LiteralPath $batchPath -Force -ErrorAction SilentlyContinue
+    }
+    if (-not $batch -or $batch.responses -isnot [array] -or $batch.responses.Count -ne $requests.Count) {
+        throw 'Microsoft Graph returned an incomplete batch response; refusing a partial report.'
+    }
+    $responseIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($response in $batch.responses) {
+        $responseId = [string]$response.id
+        if (-not $byRequestId.ContainsKey($responseId) -or -not $responseIds.Add($responseId) -or
+            $response.status -ne 200 -or $response.body.value -isnot [array]) {
+            throw 'Microsoft Graph returned a failed or malformed batch item; refusing a partial report.'
+        }
+        $entry = $byRequestId[$responseId]
+        foreach ($assignment in $response.body.value) {
+            if ($assignment.principalId -ne $entry.SpId -or -not $assignment.resourceId -or -not $assignment.appRoleId) {
+                throw 'Microsoft Graph returned an invalid client app-role assignment; refusing a partial report'
+            }
+            $assignmentsBySpId[$entry.SpId].Add($assignment)
+        }
+        $link = $response.body.'@odata.nextLink'
+        if ($null -ne $link -and $link -isnot [string]) {
+            throw 'Microsoft Graph returned an invalid app-role nextLink.'
+        }
+        if ($link) { $pending.Enqueue(@{ SpId = $entry.SpId; Uri = $link; Page = $entry.Page + 1 }) }
+    }
 }
 
 # Include registrations without a tenant SP, and SPs without a local registration
@@ -229,7 +286,7 @@ foreach ($subject in $subjects) {
     # Check delegated permissions for this app
     $servicePrincipalId = $sp.id
     $appGrants = if ($servicePrincipalId) {
-        @($grantList | Where-Object { $_.clientId -eq $servicePrincipalId })
+        @($grantsByClientId[$servicePrincipalId])
     } else {
         @()
     }
@@ -329,7 +386,8 @@ if ($findings.Count -eq 0) {
         }
         [pscustomobject]$row
     }
-    $csvFindings | Export-Csv -LiteralPath $OutputPath -NoTypeInformation
+    $csvText = @($csvFindings | ConvertTo-Csv -NoTypeInformation) -join [Environment]::NewLine
+    Write-OwnerOnlyReport -Content ($csvText + [Environment]::NewLine) -Path $OutputPath
     Write-Host "=== FINDINGS SUMMARY ===" -ForegroundColor Red
     Write-Host "Applications/service principals requiring review: $($findings.Count)" -ForegroundColor Red
     Write-Host ""

@@ -28,6 +28,10 @@ on the target workspace's `SigninLogs`/`AuditLogs` schema, data connectors,
 volume, and ingestion latency.
 
 Run the current offline suite with `python -m unittest discover -s tests -v`.
+The September 26, 2026 remediation passed 53 offline tests, including disabled
+consent through apply/rerun/rollback, explicit rejection versus uncertain CA
+creation, native argv/error boundaries, private report replacement, and a
+2,000-principal/5,000-grant fixture using 100 read-only assignment batches.
 It includes paginated Sentinel ownership/collision checks and native-command
 failure tests; no Azure or Graph request is forwarded by the test harnesses.
 The deployer and hardening script check Azure CLI exit codes explicitly, so a
@@ -59,9 +63,9 @@ failed authorization are never treated as successful cleanup.
 
 - Azure subscription with an existing **Microsoft Sentinel** workspace
 - Azure CLI configured (`az login`)
-- PowerShell 7.4+ (`pwsh`)
+- PowerShell 7.6+ (`pwsh`)
 - **Microsoft Sentinel Contributor** or equivalent rule/workbook write
-  permissions on the workspace
+  permissions on the workspace **and the workbook resource group**
 - **Directory.Read.All** Microsoft Graph delegated permission and a supported
   Entra role (such as **Directory Readers**) for the default read-only OAuth
   audit, including `/oauth2PermissionGrants` (omit the audit with `-SkipAudit`)
@@ -70,10 +74,23 @@ failed authorization are never treated as successful cleanup.
 - For the report-only Conditional Access policy used by `-ApplyHardening`:
   **Conditional Access Administrator** (or **Security Administrator**) and the
   **Policy.Read.All** plus **Policy.ReadWrite.ConditionalAccess** permissions
+- **Microsoft Entra ID P2** (or equivalent suite entitlement) for sign-in-risk
+  Conditional Access and full premium risk detail; connectors and retention must
+  supply the required `SigninLogs` and `AuditLogs` rows
 - Exact Entra object IDs for emergency-access accounts to pass through
   `-ExcludedUserIds` before applying the report-only CA policy
 - The exact active Entra tenant GUID to pass through `-ConfirmTenantId`; the
   script rejects a different or missing tenant confirmation before cloud writes
+
+The Graph permission names above describe the published endpoint permission
+requirements for an appropriately consented client. An interactive Azure CLI
+login uses Microsoft's first-party client and its preauthorized permissions;
+this revision does not claim a live validation of those policy endpoints or
+that `az login --scope Policy.*` can grant extra scopes to that first-party app.
+Use `-WhatIf` to verify the exact tenant and all reads first. A failure stays
+fatal and reports only a bounded provider code, never a token or raw response.
+Do not add blanket token-claim gates that reject valid first-party authorization
+merely because the docs list a different permission name.
 
 The existing Sentinel workspace is a shared target. The deployment creates or
 updates rules and a workbook there. Entra hardening is **off by default** because
@@ -168,9 +185,17 @@ Open **Workbooks**:
 
 ### Rule 1: OAuth Consent After Risky Sign-in (High)
 
-Correlates `SigninLogs` risk indicators with `AuditLogs` consent events within a 15-minute window.
+Correlates `SigninLogs` risk indicators with `AuditLogs` consent events within a
+15-minute window using nonempty, case-normalized Entra user object IDs. UPN
+casing and renames do not control the join. The risk list follows the current
+[Microsoft risk table](https://learn.microsoft.com/en-us/entra/id-protection/concept-identity-protection-risks),
+including verified threat actor IP, suspicious MFA approval, anomalous token,
+and threat intelligence. Values still depend on the emitted tenant schema.
+Offline detections such as malicious IP and suspicious browser can arrive later;
+inspect `AADUserRiskEvents` separately when that connector is available. This
+rule does not claim to join that table or cover all later risk updates.
 
-**MITRE:** T1566.002 (Spearphishing Link)
+**MITRE:** T1566 (Phishing). The stable `2024-03-01` deployment payload uses the parent technique; it does not send unsupported `subTechniques`.
 
 ### Rule 2: Suspicious OAuth Redirect URI Registered (Medium)
 
@@ -187,12 +212,32 @@ Groups repeated consent, scope, app-registration, grant, and client-authenticati
 ### Rule 4: Bulk OAuth Consent to Single App (High)
 
 Fires when 3+ distinct, nonempty Entra user object IDs consent to the same app
-within 1 hour. Repeated consent events from one user remain visible in the event
+in the same fixed UTC hour bin. A burst split across an hour boundary can be
+missed; this is not a rolling one-hour window. Repeated consent events from one user remain visible in the event
 count but do not satisfy the distinct-user threshold.
 
-**MITRE:** T1566.002 (Spearphishing Link)
+**MITRE:** T1566 (Phishing). The stable `2024-03-01` deployment payload uses the parent technique; it does not send unsupported `subTechniques`.
 
 ---
+
+### Scheduling and alert identity
+
+Rules run hourly over a one-day event-time lookback. Rule 1 captures source
+`ingestion_time()` on both join inputs and emits only matches with either input
+ingested during the last hour. This retains an old counterpart when the other
+side arrives late. Rule 2 filters fresh source events before expansion; rules
+3/4 retain full fixed-bin context and emit only bins with newly ingested input.
+The ingestion-time policy must be available. Delays beyond the event lookback,
+schedule drift, reingestion, and new events in an already alerted bin still need
+operator tuning; this is not an exactly-once delivery guarantee.
+
+Each result requests a separate alert. Rule 1 maps its user object ID and IP;
+rule 2 maps its initiating user and redirect URL. The aggregate rules keep their
+sets in result columns rather than mapping a set to a scalar entity identifier.
+Automatic incident grouping is disabled for all four rules so empty aggregate
+entity sets cannot collapse unrelated applications or victims. Review grouping
+after validating entity output in your own workspace. Sentinel service alert
+limits still apply.
 
 ## Hunting Queries
 
@@ -202,9 +247,17 @@ Import the queries from `detection/hunting-queries.kql` into Sentinel Hunting:
 |---|---|---|
 | 1. Enumerate Delegated Permissions | Observed user-consent events in retained logs | 90 days |
 | 2. Non-Corporate IP Sign-ins | OAuth app auth from unexpected locations | 30 days |
-| 3. New High-Privilege Apps | Recently registered apps with sensitive scopes | 14 days |
+| 3. New High-Privilege Service Principals | Recently provisioned client service principals with observed sensitive grants | 14 days |
 | 4. Redirect URI Inventory | Observed redirect URI change history in retained logs | 90 days |
 | 5. Authorization Error Followed by New-IP Authentication | Authorization-error/new-IP-success triage lead; does not prove a redirect or relay | 7 days |
+
+Hunts 1 and 3 read the explicit `ServicePrincipal.ObjectID` client property on
+grant events; the first target resource may instead name the resource API.
+Missing or ambiguous client IDs are not guessed. Hunt 3 joins client service
+principal provisioning IDs, not an application-registration object ID or a
+display name. These hunts cover retained audit events rather than a complete
+current permission inventory. Hunt 5 deliberately correlates the same user ID
+and AppId; it does not detect Microsoft's cross-application error/redirect chain.
 
 **Hunt 2** requires customization — replace the `CorporateNetworks` variable with your organization's IP ranges.
 
@@ -214,11 +267,17 @@ Import the queries from `detection/hunting-queries.kql` into Sentinel Hunting:
 
 ### User Consent Restriction
 
-The `Set-OAuthHardening.ps1` script restricts user consent to:
-- **Low-risk permissions** only (e.g., `User.Read`, `openid`, `profile`)
-- Apps from **verified publishers** and trusted tenant-owned workflows
-- Everything else requires **admin approval**
-- Existing `managePermissionGrantsForOwnedResource.*` entries are preserved when the policy is updated
+`Set-OAuthHardening.ps1` changes a recognized legacy default user-consent
+policy to `microsoft-user-default-low`. If self-service user consent is already
+disabled, it remains disabled. Existing resource-owner grants and unrelated
+policy entries are preserved. A custom self-consent policy stops the apply for
+review rather than being replaced with a possibly broader default.
+
+The built-in low-risk policy relies on tenant permission classifications;
+`User.Read`, `openid`, and `profile` are not automatically classified by this
+script. Review the actual low-impact list and verified-publisher/tenant-owned
+application conditions before enabling user consent. See
+[configure user consent](https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/configure-user-consent).
 
 This updates the tenant's authorization policy, not a lab-scoped resource.
 Before its first Graph mutation, the script writes an owner-only manifest with
@@ -235,7 +294,10 @@ Creates a new report-only lab CA policy that applies when:
 - Grant controls require **MFA**
 - Session sign-in frequency is set to **Every time**
 
-Review the policy for 7 days before enforcing it.
+The risk-based policy requires Entra ID P2. Review report-only results and
+emergency-access exclusions before deciding whether to enforce it. A fixed
+seven-day observation is not a guarantee: this policy neither blocks all OAuth
+redirect abuse nor makes MFA immune to adversary-in-the-middle phishing.
 
 The script never finds or adopts a policy by display name. A current or legacy
 same-name policy without the exact ID in the manifest is treated as foreign and
@@ -277,12 +339,19 @@ or an exhaustive privilege ranking. The numeric score counts matched flags.
 
 The existing **Directory.Read.All** read permission covers this complete audit
 path, with an endpoint-supported Entra role for delegated execution. The audit
-does not request or require extra Graph write permissions and makes only GET
-requests. See Microsoft's [delegated-grant list](https://learn.microsoft.com/en-us/graph/api/oauth2permissiongrant-list?view=graph-rest-1.0),
+does not request or require extra Graph write permissions and performs only read operations. Up to 20 app-role collection GETs are sent
+inside each POST to Graph's `/$batch`; this envelope does not change cloud data.
+Every subresponse must be 200 with a valid collection, and each client keeps its
+own guarded continuation path. A partial or throttled batch aborts before export.
+Delegated grants are indexed once by client ID instead of rescanned per subject. See Microsoft's [delegated-grant list](https://learn.microsoft.com/en-us/graph/api/oauth2permissiongrant-list?view=graph-rest-1.0),
 [service-principal list](https://learn.microsoft.com/en-us/graph/api/serviceprincipal-list?view=graph-rest-1.0),
 and [outbound app-role assignment list](https://learn.microsoft.com/en-us/graph/api/serviceprincipal-list-approleassignments?view=graph-rest-1.0).
 
-Output is a CSV sorted by risk score. Spreadsheet-formula-like text is prefixed
+Output is a CSV sorted by risk score, written through a private staging file
+and atomically replaced only after success. Windows grants only the current
+owner; Unix uses mode 0600. An existing report with broader permissions is
+rejected until you review and secure it. The default filename and `reports/`
+directory are ignored by Git; a custom output path still needs deliberate care. Spreadsheet-formula-like text is prefixed
 with an apostrophe in exported string fields; the analysis uses original values.
 Treat the CSV as sensitive tenant inventory. A failed, malformed, cyclic, or
 off-host Graph page aborts before export rather than reporting a partial scan as
@@ -291,8 +360,10 @@ inventory can explain them. A failed run leaves any prior output file unchanged;
 do not treat that older file as a result from the failed run.
 
 This is an Azure public-cloud, read-only snapshot and can encounter Graph
-replication delays or throttling. Per-principal permission enumeration adds
-requests; a denied or throttled read fails the run and can be retried later.
+replication delays or throttling. Batching reduces native CLI starts from roughly one per assignment page to
+one per 20 pages, while retaining all pages and per-item checks. It does not
+remove Graph throttling or establish a measured wall-clock time; a denied or
+throttled read fails the run and can be retried later.
 An empty findings set means only that these checks found no candidates. It does
 not audit home-tenant registration settings for external apps, effective Azure
 RBAC/Entra roles, resource-specific consent, credential validity, sign-in activity,
@@ -314,7 +385,8 @@ oauth-redirect-abuse-sentinel/
 │   └── Audit-OAuthApps.ps1             # OAuth app security audit
 ├── scripts/
 │   ├── Deploy-Lab.ps1                   # Main deployment orchestrator
-│   └── Invoke-AzChecked.ps1             # Explicit native exit-code handling
+│   ├── Invoke-AzChecked.ps1             # Native argv/exit-code handling
+│   └── Private-Report.ps1               # Owner-only atomic report writes
 ├── tests/
 │   ├── test_script_contract.py          # Existing offline contracts and fixtures
 │   ├── test_rule_pagination.py          # Complete, guarded Sentinel inventory
@@ -356,6 +428,12 @@ and remove those manually only after verifying their immutable IDs and content.
 
 ### Remove Hardening (if applied)
 
+Both the deployer and standalone hardening script default to the repository-root
+`.oauth-hardening-manifest.json`. If you supplied `-HardeningManifestPath` during
+deployment, pass that same file as `-ManifestPath` below. Older standalone runs
+may have written `hardening/.oauth-hardening-manifest.json`; explicitly select
+that existing record, never copy or invent a manifest to bypass ownership checks.
+
 Preview the drift-aware rollback:
 
 ```powershell
@@ -373,6 +451,22 @@ not remove `oauth-audit-report.csv`; handle that local report according to its
 potentially sensitive tenant inventory content.
 
 ---
+
+### Rejected or uncertain CA creation
+
+An explicit Graph 400, 401, or 403 response with a structured error code leaves
+the manifest `prepared`; fix the request/authorization and retry, or roll back
+that prepared record. The empty policy inventory is valid and does not block a
+no-change rollback. Timeouts, connection failures, 5xx, missing IDs, and unknown
+CLI errors remain `ca-create-uncertain`: apply, rollback, and their previews stop.
+Do not rerun POST or delete by display name. Retain the private manifest, confirm
+the tenant, and inspect CA audit history plus exact immutable IDs to establish
+whether creation occurred. Reconcile an uncertain record only with verified
+ownership evidence; this lab deliberately has no automatic adoption command.
+
+An older manifest whose intended consent collection would re-enable disabled
+consent cannot continue applying with this revision. Its existing drift-aware
+rollback remains available for review before starting a new apply record.
 
 ## Troubleshooting
 

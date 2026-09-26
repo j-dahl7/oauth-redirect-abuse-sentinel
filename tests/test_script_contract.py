@@ -534,7 +534,7 @@ class OAuthScriptContractTests(unittest.TestCase):
                     return '{"id":"authorizationPolicy","defaultUserRolePermissions":{"permissionGrantPoliciesAssigned":[]}}'
                 }
                 if ($request -match 'identity/conditionalAccess/policies') {
-                    return '{"value":[{"id":"foreign-policy-id","displayName":"LAB - Require MFA for Risky OAuth Sign-ins","state":"enabled"}]}'
+                    return '{"value":[{"id":"ffffffff-ffff-ffff-ffff-ffffffffffff","displayName":"LAB - Require MFA for Risky OAuth Sign-ins","state":"enabled"}]}'
                 }
                 throw "Unexpected mocked az call: $request"
             }
@@ -662,7 +662,7 @@ class OAuthScriptContractTests(unittest.TestCase):
                     return (@{ tenantId = $tenantId } | ConvertTo-Json -Compress)
                 }
                 if ($request -match '--method GET' -and $request -match 'policies/authorizationPolicy') {
-                    return '{"id":"authorizationPolicy","defaultUserRolePermissions":{"permissionGrantPoliciesAssigned":["legacy-policy"]}}'
+                    return '{"id":"authorizationPolicy","defaultUserRolePermissions":{"permissionGrantPoliciesAssigned":["managePermissionGrantsForSelf.microsoft-user-default-legacy"]}}'
                 }
                 if ($request -match '--method POST') {
                     $global:mutations += 'POST'
@@ -754,7 +754,7 @@ class OAuthScriptContractTests(unittest.TestCase):
                 }
                 if ($request -match '--method GET' -and $request -match 'identity/conditionalAccess/policies') {
                     $values = if ($global:policy) { @($global:policy) } else { @() }
-                    return (@{ value = $values } | ConvertTo-Json -Depth 20 -Compress)
+                    return (@{ value = @($values) } | ConvertTo-Json -Depth 20 -Compress)
                 }
                 if ($request -match '--method POST') {
                     $global:mutations += 'POST'
@@ -900,7 +900,7 @@ class OAuthScriptContractTests(unittest.TestCase):
             $excludedId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
             $createdId = 'cccccccc-cccc-cccc-cccc-cccccccccccc'
             $manifestPath = Join-Path $env:OAUTH_TEST_DIR 'manifest.json'
-            $global:originalConsent = @('legacy-policy')
+            $global:originalConsent = @('managePermissionGrantsForSelf.microsoft-user-default-legacy')
             $global:currentConsent = @($global:originalConsent)
             $global:policy = $null
             $global:mutations = @()
@@ -932,7 +932,7 @@ class OAuthScriptContractTests(unittest.TestCase):
                 }
                 if ($request -match '--method GET' -and $request -match 'identity/conditionalAccess/policies') {
                     $values = if ($global:policy) { @($global:policy) } else { @() }
-                    return (@{ value = $values } | ConvertTo-Json -Depth 20 -Compress)
+                    return (@{ value = @($values) } | ConvertTo-Json -Depth 20 -Compress)
                 }
                 if ($request -match '--method POST') {
                     $global:mutations += 'POST'
