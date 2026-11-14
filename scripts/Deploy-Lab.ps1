@@ -1,11 +1,13 @@
 #Requires -Version 7.6
+
 <#
 .SYNOPSIS
     Deploys the OAuth Redirect Abuse Detection Lab.
 
 .DESCRIPTION
     Deploys detection and hardening resources to an existing Microsoft Sentinel workspace:
-    1. Sentinel analytics rules (4 scheduled rules for OAuth abuse detection)
+    1. Sentinel analytics rules (4 scheduled rules for OAuth abuse detection),
+       created disabled unless -EnableRules is supplied
     2. Five KQL hunting queries included in the repository for manual use
     3. Sentinel workbook (OAuth Security Dashboard)
     4. Optional OAuth hardening policies (user consent restrictions, CA policy)
@@ -16,6 +18,13 @@
 
 .PARAMETER WorkspaceName
     Name of the Log Analytics workspace with Sentinel enabled.
+
+.PARAMETER EnableRules
+    Create or update the four analytics rules enabled. Without this switch the
+    rules are created or updated disabled, so they do not run, raise alerts, or
+    create incidents until an operator has reviewed the queries. A later run
+    without this switch sets the lab's rules back to disabled. Not valid with
+    -Destroy. Alias: -EnableSentinelRules.
 
 .PARAMETER ApplyHardening
     Apply tenant-level OAuth hardening policies. Omitted by default so the lab deploys detection-only.
@@ -44,7 +53,11 @@
 
 .EXAMPLE
     ./Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab"
-    Deploy detection rules, workbook, and audit to an existing Sentinel workspace.
+    Deploy the detection rules disabled, plus the workbook and audit, to an existing Sentinel workspace.
+
+.EXAMPLE
+    ./Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -EnableRules -SkipAudit
+    After reviewing the queries, redeploy with the four analytics rules enabled.
 
 .EXAMPLE
     ./Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab" -ApplyHardening
@@ -62,6 +75,10 @@ param(
 
     [Parameter(Mandatory)]
     [string]$WorkspaceName,
+
+    [Parameter()]
+    [Alias('EnableSentinelRules')]
+    [switch]$EnableRules,
 
     [Parameter()]
     [switch]$ApplyHardening,
@@ -95,6 +112,13 @@ $LabWorkbookTitle = 'OAuth Security Dashboard'
 if ([string]::IsNullOrWhiteSpace($HardeningManifestPath)) {
     $HardeningManifestPath = Join-Path $LabRoot '.oauth-hardening-manifest.json'
 }
+if ($Destroy -and $EnableRules) {
+    throw '-EnableRules applies only to deployment and cannot be combined with -Destroy.'
+}
+# Safe default: the analytics rules are created or updated disabled. They run,
+# raise alerts, and create incidents only after an explicit -EnableRules.
+$RulesEnabled = [bool]$EnableRules
+$ruleStateWord = if ($RulesEnabled) { 'enabled' } else { 'disabled' }
 
 function Get-LabResourceGuid {
     param(
@@ -167,6 +191,9 @@ function Get-AllLabAlertRules {
 Write-Host "`n=== OAuth Redirect Abuse Detection Lab ===" -ForegroundColor Cyan
 Write-Host "Resource Group: $ResourceGroup"
 Write-Host "Workspace:      $WorkspaceName"
+if (-not $Destroy) {
+    Write-Host "Rule state:     $(if ($RulesEnabled) { 'ENABLED by -EnableRules' } else { 'DISABLED (safe default; add -EnableRules to enable)' })"
+}
 Write-Host ""
 
 # Verify prerequisites
@@ -526,6 +553,9 @@ if ($Destroy) {
 foreach ($state in $ruleStates) {
     $rule = $state.Definition
     Write-Host "  Deploying: $($rule.displayName)"
+    if (-not $RulesEnabled -and $state.Existing -and $state.Existing.properties.enabled -eq $true) {
+        Write-Host "    Currently enabled; deploying without -EnableRules sets it to disabled." -ForegroundColor Yellow
+    }
 
     $ruleBody = @{
         kind       = "Scheduled"
@@ -544,7 +574,7 @@ foreach ($state in $ruleStates) {
             techniques            = $rule.techniques
             eventGroupingSettings = @{ aggregationKind = "AlertPerResult" }
             entityMappings        = $rule.entityMappings
-            enabled               = $true
+            enabled               = $RulesEnabled
             incidentConfiguration = @{
                 createIncident        = $true
                 groupingConfiguration = @{
@@ -560,7 +590,7 @@ foreach ($state in $ruleStates) {
     $ruleId = $state.ResourceId
     $ruleAction = if ($state.Existing) { "Updated" } else { "Created" }
 
-    if ($PSCmdlet.ShouldProcess($rule.displayName, "$ruleAction Sentinel analytics rule")) {
+    if ($PSCmdlet.ShouldProcess($rule.displayName, "$ruleAction Sentinel analytics rule ($ruleStateWord)")) {
         $bodyFile = New-TemporaryFile
         try {
             [System.IO.File]::WriteAllText($bodyFile.FullName, $ruleBody, [System.Text.Encoding]::UTF8)
@@ -569,11 +599,14 @@ foreach ($state in $ruleStates) {
                 --body "@$($bodyFile.FullName)" `
                 --headers 'Content-Type=application/json' 2>$null | ConvertFrom-Json
 
-            if ($result.name) {
-                Write-Host "    ${ruleAction}: $($result.name)" -ForegroundColor Green
-            } else {
+            if (-not $result.name) {
                 throw "Sentinel did not return an analytics rule resource"
             }
+            # The summary reports the rule state, so require the service to echo it.
+            if ($result.properties.enabled -isnot [bool] -or $result.properties.enabled -ne $RulesEnabled) {
+                throw "Sentinel did not confirm analytics rule '$($rule.displayName)' as $ruleStateWord. Inspect the rule in the workspace before relying on its state."
+            }
+            Write-Host "    ${ruleAction}: $($result.name) ($ruleStateWord)" -ForegroundColor Green
         }
         finally {
             Remove-Item $bodyFile.FullName -ErrorAction SilentlyContinue
@@ -728,6 +761,11 @@ Write-Host "`n[5/5] $completionLabel" -ForegroundColor Green
 Write-Host ""
 Write-Host "=== $(if ($WhatIfPreference) { 'Planned Resources' } else { 'Deployed Resources' }) ===" -ForegroundColor Cyan
 Write-Host "  Analytics Rules: 4 scheduled rules"
+if ($RulesEnabled) {
+    Write-Host "  Rule state:      ENABLED by -EnableRules (hourly runs; each result requests an alert, with incident creation on)"
+} else {
+    Write-Host "  Rule state:      DISABLED (safe default; disabled rules do not run, raise alerts, or create incidents)"
+}
 Write-Host "  Workbook:        OAuth Security Dashboard"
 if ($ApplyHardening -and -not $SkipHardening -and -not $WhatIfPreference) {
     Write-Host "  Hardening:       User consent restricted, CA policy (report-only)"
@@ -737,8 +775,19 @@ if (-not $SkipAudit -and -not $WhatIfPreference) {
 }
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Yellow
-Write-Host "  1. Open Microsoft Sentinel > Analytics to review the 4 new rules"
-Write-Host "  2. Open Workbooks > 'OAuth Security Dashboard' to see the dashboard"
-Write-Host "  3. Run the hunting queries in detection/hunting-queries.kql"
-Write-Host "  4. Review the CA policy in Entra admin center (report-only mode)"
+Write-Host "  1. Open Microsoft Sentinel > Configuration > Analytics to review the 4 LAB rules"
+if ($RulesEnabled) {
+    Write-Host "  2. -EnableRules deploys the rules enabled. To disable them, rerun without"
+    Write-Host "     -EnableRules or disable each rule on the Active rules tab."
+} else {
+    Write-Host "  2. The rules deploy disabled. After reviewing the queries, enable them with:"
+    Write-Host "       ./scripts/Deploy-Lab.ps1 -ResourceGroup '$ResourceGroup' -WorkspaceName '$WorkspaceName' -EnableRules -SkipAudit"
+    Write-Host "     A rerun rewrites each rule from this repository; if you edited a rule in the"
+    Write-Host "     portal, enable it on the Active rules tab instead. A later run without"
+    Write-Host "     -EnableRules disables the rules again. Enable them before generating test"
+    Write-Host "     activity: each rule alerts only on matches with rows ingested in the hour before a run."
+}
+Write-Host "  3. Open Workbooks > 'OAuth Security Dashboard' to see the dashboard"
+Write-Host "  4. Run the hunting queries in detection/hunting-queries.kql"
+Write-Host "  5. Review the CA policy in Entra admin center (report-only mode)"
 Write-Host ""
