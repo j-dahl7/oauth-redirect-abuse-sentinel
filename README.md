@@ -7,6 +7,10 @@ its [March 2026 advisory](https://www.microsoft.com/en-us/security/blog/2026/03/
 **Cost:** Uses an existing Sentinel workspace; ingestion, retention, and
 licensing charges still apply.
 
+**Rule state:** The four analytics rules are created disabled. They run, raise
+alerts, and create incidents only after you enable them, with `-EnableRules` or
+in the portal.
+
 **Cleanup:** Remove the lab-owned Sentinel objects and, only if applied, restore
 the captured tenant consent configuration and remove the exact CA policy.
 
@@ -44,6 +48,20 @@ failure tests; no Azure or Graph request is forwarded by the test harnesses.
 The deployer and hardening script check Azure CLI exit codes explicitly, so a
 failed read or delete is fatal even when automatic native-error handling is disabled.
 
+The November 13, 2026 revision changes one default: the deployer creates or
+updates its four analytics rules disabled unless `-EnableRules` is supplied.
+It had offline checks only: PowerShell parsing and 63 offline tests passed. The
+new tests run the real deployer against mocked Azure responses and read every
+rule request body: disabled by default, enabled only with `-EnableRules` or its
+`-EnableSentinelRules` alias, enabled rules returned to disabled by a rerun
+without the switch, a mismatched or missing state in the service response
+treated as fatal, and `-EnableRules` rejected with `-Destroy` before any Azure
+call. A blank line after `#Requires` now lets `Get-Help` read the deployer's
+comment-based help, which earlier revisions did not expose. No rule, hunt, or
+workbook KQL changed. Nothing was deployed to a tenant: no rule was created,
+enabled, or run, no alert or incident was produced, and the time a rule first
+runs after it is enabled was not measured.
+
 A manifest already recorded as `rolled-back` supports a no-write rerun. For a
 pending or applied manifest, an exact policy read returning HTTP 404 does not
 prove that this rollback removed it: the script stops and retains the manifest,
@@ -57,7 +75,7 @@ failed authorization are never treated as successful cleanup.
 
 | Resource | Type | Details |
 |---|---|---|
-| 4 Analytics Rules | Sentinel Scheduled | OAuth consent after risky sign-in, suspicious redirect URI, OAuth error patterns, bulk consent |
+| 4 Analytics Rules | Sentinel Scheduled | OAuth consent after risky sign-in, suspicious redirect URI, OAuth error patterns, bulk consent; created disabled unless `-EnableRules` is supplied |
 | 1 Workbook | Azure Workbook | OAuth Security Dashboard (consent timeline, error patterns, URI changes, top apps) |
 | Optional consent policy change | Entra ID | Tenant authorization-policy update; applied only with `-ApplyHardening` |
 | Optional CA Policy | Entra ID | Newly created report-only step-up policy; same-named policies are never adopted or updated |
@@ -100,7 +118,9 @@ Do not add blanket token-claim gates that reject valid first-party authorization
 merely because the docs list a different permission name.
 
 The existing Sentinel workspace is a shared target. The deployment creates or
-updates rules and a workbook there. Entra hardening is **off by default** because
+updates rules and a workbook there. The rules are **disabled by default**, so a
+shared workspace receives no alerts or incidents from them until you enable
+them. Entra hardening is **off by default** because
 the consent-policy change is tenant-wide and the CA policy applies to all users
 except the object IDs you explicitly exclude.
 
@@ -126,9 +146,9 @@ Preview first:
   -WhatIf
 ```
 
-Default deployment writes the four Sentinel rules and workbook, then performs
-a read-only Graph audit and writes `oauth-audit-report.csv` locally. It does not
-apply tenant hardening:
+Default deployment writes the four Sentinel rules disabled and the workbook,
+then performs a read-only Graph audit and writes `oauth-audit-report.csv`
+locally. It does not enable the rules or apply tenant hardening:
 
 ```powershell
 ./scripts/Deploy-Lab.ps1 -ResourceGroup "rg-sentinel-lab" -WorkspaceName "law-sentinel-lab"
@@ -153,10 +173,15 @@ object IDs, opt in to hardening:
   -ExcludedUserIds @("<break-glass-object-id-1>","<break-glass-object-id-2>")
 ```
 
+Every run sets the rule state. If you already enabled the rules, add
+`-EnableRules` to this command too; without it the run sets them back to
+disabled.
+
 The script:
 
 1. Verifies the Sentinel workspace exists and Sentinel is enabled
-2. Deploys 4 scheduled analytics rules via the Sentinel REST API
+2. Creates or updates 4 scheduled analytics rules via the Sentinel REST API,
+   disabled unless `-EnableRules` is present
 3. Deploys the OAuth Security Dashboard workbook
 4. Applies OAuth hardening only when `-ApplyHardening` is present
 5. Runs the OAuth app audit and saves a CSV report unless `-SkipAudit` is present
@@ -164,27 +189,73 @@ The script:
 `-WhatIf` performs discovery/read calls but skips guarded cloud writes, the
 ownership manifest, temporary request-body files, and the audit/CSV. It reports
 missing tenant confirmation or emergency-access exclusions without applying
-anything. It does not validate KQL results or CA impact. `-SkipHardening` remains only as a deprecated
+anything. It also reports the rule state a deployment would apply and names each
+enabled lab rule that a run without `-EnableRules` would disable. It does not
+validate KQL results or CA impact. `-SkipHardening` remains only as a deprecated
 compatibility switch; absence of `-ApplyHardening` is the normal safe default.
 Analytics rules and the workbook use deterministic workspace-scoped IDs plus
 explicit ownership markers. Deployment fails closed instead of adopting a
 same-named resource or overwriting a deterministic ID whose marker does not match.
 
 Current deployment parameters are `-ResourceGroup`, `-WorkspaceName`,
-`-ApplyHardening`, `-ConfirmTenantId`, `-ExcludedUserIds`,
-`-HardeningManifestPath`, `-SkipHardening` (deprecated), `-SkipAudit`,
-`-Destroy`, and PowerShell's common `-WhatIf` switch.
+`-EnableRules` (alias `-EnableSentinelRules`), `-ApplyHardening`,
+`-ConfirmTenantId`, `-ExcludedUserIds`, `-HardeningManifestPath`,
+`-SkipHardening` (deprecated), `-SkipAudit`, `-Destroy`, and PowerShell's
+common `-WhatIf` switch. `Get-Help ./scripts/Deploy-Lab.ps1 -Full` prints the
+description of each one.
 
 ### 3. Verify Deployment
 
-Open **Microsoft Defender portal** > **Microsoft Sentinel** > **Analytics**:
+Open **Microsoft Defender portal** > **Microsoft Sentinel** > **Configuration** > **Analytics**:
 
-- You should see 4 new rules prefixed with "LAB -"
-- All rules should show as Enabled with Scheduled type
+- You should see 4 new rules prefixed with "LAB -" on the **Active rules** tab
+- All four should show the Scheduled type and a Disabled status, or Enabled if
+  you deployed with `-EnableRules`
 
 Open **Workbooks**:
 
 - Find "OAuth Security Dashboard" in the list
+
+### 4. Enable the Rules
+
+The four rules are created disabled. Microsoft's
+[scheduled-rule guide](https://learn.microsoft.com/en-us/azure/sentinel/create-analytics-rules)
+describes that status as a rule that is created but doesn't run, so a disabled
+rule raises no alerts and creates no incidents. Before you enable the rules,
+review each query, confirm that `SigninLogs` and `AuditLogs` are arriving, and
+note that rule 3 ships with an empty `ApprovedAppIds` allowlist, so it
+suppresses nothing until you add your own tenant's application IDs.
+
+Then rerun the deployer with `-EnableRules`. `-SkipAudit` only avoids repeating
+the read-only audit:
+
+```powershell
+./scripts/Deploy-Lab.ps1 `
+  -ResourceGroup "rg-sentinel-lab" `
+  -WorkspaceName "law-sentinel-lab" `
+  -EnableRules `
+  -SkipAudit
+```
+
+- Once enabled, each rule runs hourly, each result requests its own alert, and
+  incident creation is on. See [Scheduling and alert identity](#scheduling-and-alert-identity).
+- The deployer rewrites each rule from this repository on every run. If you
+  edited a rule's query in the portal, either enable that rule on the
+  **Active rules** tab of the Analytics page instead, or make the same edit in
+  `scripts/Deploy-Lab.ps1` and `detection/analytics-rules.kql` before rerunning.
+- The switch states the wanted state on every run. A later run without
+  `-EnableRules` sets the lab's rules back to disabled, including rules you
+  enabled in the portal, and prints a notice for each rule it turns off.
+- Enable the rules before you generate test activity. Every rule emits only
+  matches with source rows ingested during the hour before a run, so a match
+  whose rows were all ingested more than an hour before an enabled rule's first
+  run is never alerted.
+- `-EnableSentinelRules` is accepted as an alias for `-EnableRules`. Neither
+  can be combined with `-Destroy`.
+
+If you deployed an earlier revision of this lab, its rules were created enabled.
+Running this revision without `-EnableRules` disables them; pass the switch to
+keep them running.
 
 ---
 
@@ -229,7 +300,7 @@ count but do not satisfy the distinct-user threshold.
 
 ### Scheduling and alert identity
 
-Rules run hourly over a one-day event-time lookback. Rule 1 captures source
+Once enabled, rules run hourly over a one-day event-time lookback. Rule 1 captures source
 `ingestion_time()` on both join inputs and emits only matches with either input
 ingested during the last hour. This retains an old counterpart when the other
 side arrives late. Rule 2 filters fresh source events before expansion; rules
@@ -244,7 +315,11 @@ sets in result columns rather than mapping a set to a scalar entity identifier.
 Automatic incident grouping is disabled for all four rules so empty aggregate
 entity sets cannot collapse unrelated applications or victims. Review grouping
 after validating entity output in your own workspace. Sentinel service alert
-limits still apply.
+limits still apply. Incident creation stays on in every rule definition, so an
+enabled rule's alerts become incidents without a second edit; a disabled rule
+produces neither. Microsoft's scheduled-rule guide also says to leave incident
+creation enabled when Sentinel is onboarded to the Defender portal, where
+Defender XDR creates the incidents.
 
 ## Hunting Queries
 
@@ -397,6 +472,7 @@ oauth-redirect-abuse-sentinel/
 ├── tests/
 │   ├── test_script_contract.py          # Existing offline contracts and fixtures
 │   ├── test_rule_pagination.py          # Complete, guarded Sentinel inventory
+│   ├── test_rule_enablement.py          # Rules disabled unless -EnableRules
 │   ├── test_native_exit.py              # Native failure and cleanup behavior
 │   └── fixtures/                       # AppAddress and bulk-consent events
 └── .gitignore                          # Keeps local hardening manifests private
@@ -428,7 +504,8 @@ Then remove the four analytics rules and workbook owned by this lab:
 ```
 
 Cleanup validates every deterministic resource ID and ownership marker before
-issuing its first delete. It refuses same-title foreign objects and resources
+issuing its first delete. It removes the owned rules whether they are enabled or
+disabled. It refuses same-title foreign objects and resources
 whose immutable ID, title/display name, or marker does not match. Legacy objects
 from older random-ID revisions are intentionally not adopted or deleted; review
 and remove those manually only after verifying their immutable IDs and content.
@@ -479,7 +556,13 @@ rollback remains available for review before starting a new apply record.
 
 ### Rules Don't Fire
 
-Analytics rules need matching data in `SigninLogs` and `AuditLogs`. If you don't have OAuth consent events or risky sign-ins in your tenant, the rules will be silent. Test by:
+Check the rule status first. The rules are created disabled and do not run
+until you deploy with `-EnableRules` or enable them on the **Active rules** tab
+(see [Enable the Rules](#4-enable-the-rules)). A match whose rows were all
+ingested more than an hour before an enabled rule runs is not alerted, so enable
+the rules before you generate test events.
+
+Enabled analytics rules need matching data in `SigninLogs` and `AuditLogs`. If you don't have OAuth consent events or risky sign-ins in your tenant, the rules will be silent. Test by:
 
 1. Registering a test app with a redirect URI containing `webhook.site` (triggers Rule 2)
 2. Checking that `AuditLogs` contains "Add application" events
@@ -518,5 +601,7 @@ Administrator**) and **Policy.Read.All** plus
 - [Microsoft identity platform: Authorization code flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow)
 - [Microsoft: Configure user consent settings](https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/configure-user-consent)
 - [Microsoft: Conditional Access for risky sign-ins](https://learn.microsoft.com/en-us/entra/id-protection/howto-identity-protection-configure-risk-policies)
+- [Microsoft Sentinel: Create scheduled analytics rules (rule status, Active rules tab)](https://learn.microsoft.com/en-us/azure/sentinel/create-analytics-rules)
+- [Microsoft Sentinel REST API: Alert Rules - Create Or Update, 2024-03-01 (`properties.enabled`)](https://learn.microsoft.com/en-us/rest/api/securityinsights/alert-rules/create-or-update?view=rest-securityinsights-2024-03-01)
 - [Azure Monitor Logs reference: SigninLogs](https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/signinlogs)
 - [KQL Reference](https://learn.microsoft.com/en-us/kusto/query/)
